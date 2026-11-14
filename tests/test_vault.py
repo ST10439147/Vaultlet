@@ -1,4 +1,6 @@
 import json
+import os
+import stat
 
 import pytest
 
@@ -61,3 +63,38 @@ def test_unlock_and_read_entries_happy_path(tmp_path):
     f = crypto.write_entries(f, crypto.unlock(f, "pw"), [{"title": "GitHub"}])
     vk = vault.unlock(f, "pw")
     assert vault.read_entries(f, vk) == [{"title": "GitHub"}]
+
+
+def test_failed_save_keeps_old_file(tmp_path, monkeypatch):
+    path, f, _ = make_file(tmp_path)
+    before = path.read_bytes()
+
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(vault.os, "replace", boom)
+    with pytest.raises(OSError):
+        vault.save(path, {**f, "marker": 1})
+    assert path.read_bytes() == before
+    assert not (tmp_path / "vault.json.tmp").exists()
+
+
+def test_first_save_creates_no_backup(tmp_path):
+    path = tmp_path / "vault.json"
+    vault.save(path, {"marker": 1})
+    assert not (tmp_path / "vault.json.bak").exists()
+
+
+def test_save_keeps_one_backup_of_previous_version(tmp_path):
+    path, f, _ = make_file(tmp_path)
+    vault.save(path, {**f, "marker": 2})
+    vault.save(path, {**f, "marker": 3})
+    backup = json.loads((tmp_path / "vault.json.bak").read_text(encoding="utf-8"))
+    assert backup["marker"] == 2
+    assert json.loads(path.read_text(encoding="utf-8"))["marker"] == 3
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes only")
+def test_vault_file_mode_is_0600(tmp_path):
+    path, _, _ = make_file(tmp_path)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
