@@ -1,6 +1,8 @@
 """Vault file I/O and error mapping. Crypto lives in crypto.py."""
 
 import json
+import os
+import shutil
 from pathlib import Path
 
 from cryptography.exceptions import InvalidTag
@@ -24,8 +26,22 @@ def load(path: str | Path) -> dict:
 
 
 def save(path: str | Path, file: dict) -> None:
-    # ponytail: plain write; atomic temp-file + os.replace comes in section 2
-    Path(path).write_text(json.dumps(file), encoding="utf-8")
+    """Atomically replace the vault file, keeping one .bak of the previous version."""
+    path = Path(path)
+    data = json.dumps(file).encode("utf-8")
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if path.exists():
+            shutil.copyfile(path, path.with_name(path.name + ".bak"))
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def unlock(file: dict, password: str) -> bytes:
