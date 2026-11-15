@@ -64,6 +64,22 @@ def read_entries(file: dict, vault_key: bytes) -> list[dict]:
         raise CorruptVault("vault contents are malformed") from exc
 
 
+def create(path: str | Path, password: str) -> None:
+    path = Path(path)
+    if path.exists():
+        raise FileExistsError(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file, _ = crypto.new_vault(password)
+    save(path, file)
+
+
+def open_vault(path: str | Path, password: str) -> tuple[dict, bytes, list[dict]]:
+    """Load, unlock and decrypt. Returns (file, vault_key, entries)."""
+    file = load(path)
+    vault_key = unlock(file, password)
+    return file, vault_key, read_entries(file, vault_key)
+
+
 # Entry operations work on the decrypted list in memory. Callers persist with persist().
 
 def add(entries: list[dict], *, title: str, username: str = "", password: str = "",
