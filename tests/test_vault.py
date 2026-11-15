@@ -5,7 +5,7 @@ import stat
 import pytest
 
 from vaultlet import crypto, vault
-from vaultlet.errors import CorruptVault, WrongPassword
+from vaultlet.errors import CorruptVault, EntryNotFound, WrongPassword
 
 
 def make_file(tmp_path, password="pw"):
@@ -98,3 +98,62 @@ def test_save_keeps_one_backup_of_previous_version(tmp_path):
 def test_vault_file_mode_is_0600(tmp_path):
     path, _, _ = make_file(tmp_path)
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_add_gives_unique_ids_and_stores_fields():
+    entries = []
+    a = vault.add(entries, title="GitHub", username="dillo", password="p1")
+    b = vault.add(entries, title="Mail")
+    assert a["id"] != b["id"]
+    assert vault.get(entries, a["id"])["password"] == "p1"
+    assert b["username"] == "" and b["notes"] == ""
+
+
+def test_get_missing_entry_raises():
+    with pytest.raises(EntryNotFound):
+        vault.get([], "nope")
+
+
+def test_edit_changes_fields_and_rejects_unknown():
+    entries = []
+    e = vault.add(entries, title="GitHub")
+    vault.edit(entries, e["id"], username="dillo", url="https://github.com")
+    assert vault.get(entries, e["id"])["username"] == "dillo"
+    with pytest.raises(ValueError):
+        vault.edit(entries, e["id"], id="hijack")
+
+
+def test_delete_removes_entry_and_missing_raises():
+    entries = []
+    e = vault.add(entries, title="GitHub")
+    vault.delete(entries, e["id"])
+    assert entries == []
+    with pytest.raises(EntryNotFound):
+        vault.delete(entries, e["id"])
+
+
+def test_search_matches_title_and_username_not_password():
+    entries = []
+    vault.add(entries, title="GitHub", username="dillo")
+    vault.add(entries, title="Bank", username="alice", password="github-ish")
+    assert [e["title"] for e in vault.search(entries, "GITHUB")] == ["GitHub"]
+    assert [e["title"] for e in vault.search(entries, "ALICE")] == ["Bank"]
+    assert vault.search(entries, "github-ish") == []
+
+
+def test_list_is_sorted_case_insensitively():
+    entries = []
+    vault.add(entries, title="beta")
+    vault.add(entries, title="Alpha")
+    assert [e["title"] for e in vault.list_entries(entries)] == ["Alpha", "beta"]
+
+
+def test_persist_roundtrip_through_file(tmp_path):
+    path, f, vk = make_file(tmp_path, password="pw")
+    entries = []
+    vault.add(entries, title="GitHub", password="s3cret")
+    vault.persist(path, f, vk, entries)
+
+    loaded = vault.load(path)
+    key = vault.unlock(loaded, "pw")
+    assert vault.read_entries(loaded, key) == entries

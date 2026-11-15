@@ -8,3 +8,7 @@ class WrongPassword(VaultletError):
 
 class CorruptVault(VaultletError):
     """The vault file is malformed or failed authentication."""
+
+
+class EntryNotFound(VaultletError):
+    """No entry with the given id exists in the vault."""
