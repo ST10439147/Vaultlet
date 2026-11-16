@@ -82,3 +82,19 @@ def test_unknown_id_and_empty_edit_fail(tmp_path):
     path = init(tmp_path)
     assert run(path, "get", "deadbeef", input="pw\n").exit_code == 1
     assert run(path, "edit", "deadbeef").exit_code == 1
+
+
+def test_generate_command_needs_no_vault(tmp_path):
+    r = run(tmp_path / "missing.json", "generate", "--length", "30", "--no-symbols")
+    assert r.exit_code == 0, r.output
+    pw = r.output.strip()
+    assert len(pw) == 30 and pw.isalnum()
+    assert not (tmp_path / "missing.json").exists()
+
+
+def test_add_generated_without_symbols(tmp_path):
+    path = init(tmp_path)
+    run(path, "add", "Bank", "-g", "--no-symbols", input="pw\n")
+    short_id = run(path, "list", input="pw\n").output.strip().splitlines()[-1].split()[0]
+    pw = field(run(path, "get", short_id, "--show", input="pw\n").output, "password")
+    assert len(pw) == 20 and pw.isalnum()

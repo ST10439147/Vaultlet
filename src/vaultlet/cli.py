@@ -21,6 +21,7 @@ app = typer.Typer(help="Vaultlet: a local, encrypted password manager.", no_args
 
 Length = Annotated[int, typer.Option("--length", min=4, help="Length for --generate.")]
 Generate = Annotated[bool, typer.Option("--generate", "-g", help="Generate a strong password.")]
+Symbols = Annotated[bool, typer.Option("--symbols/--no-symbols", help="Include symbols when generating.")]
 
 
 def fail(message: str) -> NoReturn:
@@ -32,9 +33,9 @@ def ask_master(confirm: bool = False) -> str:
     return typer.prompt("Master password", hide_input=True, confirmation_prompt=confirm)
 
 
-def ask_entry_password(gen: bool, length: int) -> str:
+def ask_entry_password(gen: bool, length: int, symbols: bool) -> str:
     if gen:
-        return generate(length)
+        return generate(length, symbols)
     return typer.prompt("Entry password", hide_input=True, confirmation_prompt=True)
 
 
@@ -72,6 +73,12 @@ def main(
     ctx.obj = vault_path
 
 
+@app.command("generate")
+def generate_cmd(length: Length = 20, symbols: Symbols = True) -> None:
+    """Print a strong random password. No vault needed; nothing is saved."""
+    typer.echo(generate(length, symbols))
+
+
 @app.command()
 def init(ctx: typer.Context) -> None:
     """Create a new, empty vault."""
@@ -91,12 +98,13 @@ def add(
     notes: Annotated[str, typer.Option()] = "",
     gen: Generate = False,
     length: Length = 20,
+    symbols: Symbols = True,
 ) -> None:
     """Add an entry. The password is prompted for, or generated with --generate."""
     path: Path = ctx.obj
     file, key, entries = unlock(path)
     entry = vault.add(entries, title=title, username=username,
-                      password=ask_entry_password(gen, length), url=url, notes=notes)
+                      password=ask_entry_password(gen, length, symbols), url=url, notes=notes)
     vault.persist(path, file, key, entries)
     typer.echo(f"Added {entry['title']} ({entry['id'][:8]})")
 
@@ -143,6 +151,7 @@ def edit(
     password: Annotated[bool, typer.Option("--password", help="Prompt for a new password.")] = False,
     gen: Generate = False,
     length: Length = 20,
+    symbols: Symbols = True,
 ) -> None:
     """Change fields of an entry."""
     fields = {"title": title, "username": username, "url": url, "notes": notes}
@@ -153,7 +162,7 @@ def edit(
     file, key, entries = unlock(path)
     entry = resolve(entries, entry_id)
     if password or gen:
-        changes["password"] = ask_entry_password(gen, length)
+        changes["password"] = ask_entry_password(gen, length, symbols)
     vault.edit(entries, entry["id"], **changes)
     vault.persist(path, file, key, entries)
     typer.echo(f"Updated {entry['title']}")
