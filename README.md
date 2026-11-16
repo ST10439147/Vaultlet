@@ -11,6 +11,10 @@ Password management system: a local-first, zero-knowledge password manager in Py
 | Shoulder-surfing, walk-up access | Partly | Passwords masked unless `--show`; `shell` clears the screen and locks when idle; copied passwords cleared after 20 s |
 | Clipboard history / cloud clipboard (Windows Win+V) | No | Those keep their own copy; leave them off |
 | Secrets in crash tracebacks | Yes | Typer `pretty_exceptions_show_locals` forced off |
+| Leaked master password | Yes, going forward | `passwd` re-keys the vault and its `.bak`; old copies elsewhere (backups, sync, SSD remnants) still open with it |
+| Stolen encrypted export | Yes | Same Argon2id + AES-GCM as the vault; only as strong as the export password |
+| Browser CSV left on disk | No | It is plaintext; `import-csv` warns, but deleting it is up to you |
+| Hostile vault/export file with huge KDF settings | Yes | KDF parameters are bounded at load |
 | Weak master password | No | Strength check only; cannot be fixed in code |
 | Malware or keylogger on your machine | No | Out of scope |
 | Memory scraping while unlocked | Limited | Python cannot reliably wipe memory |
@@ -19,8 +23,8 @@ This is a learning and portfolio project. Keep real credentials in an audited ma
 
 ## Crypto decisions
 
-- **KDF:** Argon2id (`argon2-cffi`), 32-byte KEK, time_cost 3, memory 64 MiB, parallelism 4. Tune upward until unlock takes about 0.5–1 s.
-- **Vault key:** random 32 bytes, wrapped with the KEK via AES-256-GCM. Changing the master password re-wraps only the vault key.
+- **KDF:** Argon2id (`argon2-cffi`), 32-byte KEK, time_cost 3, memory 64 MiB, parallelism 4. Tune upward until unlock takes about 0.5–1 s. A vault below the defaults is re-keyed to them on its next unlock; KDF parameters above 50 passes, 4 GiB or 64 lanes are rejected as corrupt so a hostile file can't stall the machine.
+- **Vault key:** random 32 bytes, wrapped with the KEK via AES-256-GCM. Changing the master password or KDF parameters keeps the vault key, re-wraps it under a fresh salt, and re-seals the entries (the header is in both AADs). Only one Argon2id run is needed.
 - **Nonces:** fresh 96-bit `os.urandom` for every encryption.
 - **AAD:** the header (version and KDF parameters) is authenticated into both ciphertexts, with `key` or `vault` as a purpose suffix.
 - **Passwords:** Unicode NFKC-normalised before derivation.
@@ -35,6 +39,11 @@ vaultlet list                       # ids, titles, usernames; never passwords
 vaultlet get <id>                   # password masked
 vaultlet get <id> --copy            # copy password; clipboard clears after 20 s (Ctrl+C clears now)
 vaultlet generate --length 30       # print a password; no vault needed
+vaultlet passwd                     # change the master password (always asks for the current one)
+vaultlet upgrade-kdf --time-cost 4  # stronger Argon2id (never below the defaults)
+vaultlet export backup.json         # separate vault file with its own export password
+vaultlet import-vault backup.json   # merge an export back in (skips ids already present)
+vaultlet import-csv passwords.csv   # Chrome / Edge / Firefox export; delete the CSV afterwards
 vaultlet shell --idle 300           # unlock once; locks and clears the screen after 300 s idle
 ```
 

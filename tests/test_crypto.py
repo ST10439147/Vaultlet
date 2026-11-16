@@ -37,3 +37,23 @@ def test_nonce_is_fresh():
     f, vk = crypto.new_vault("pw")
     f2 = crypto.write_entries(f, vk, [])
     assert f["vault"]["nonce"] != f2["vault"]["nonce"]
+
+
+def test_rekey_changes_password_keeps_key_and_entries():
+    f, vk = crypto.new_vault("old")
+    f = crypto.write_entries(f, vk, [{"title": "GitHub"}])
+    f2 = crypto.rekey(f, vk, crypto.read_entries(f, vk), "new")
+    assert crypto.unlock(f2, "new") == vk
+    assert crypto.read_entries(f2, vk) == [{"title": "GitHub"}]
+    assert f2["kdf"]["salt"] != f["kdf"]["salt"]
+    assert f2["vault"]["nonce"] != f["vault"]["nonce"]
+    with pytest.raises(InvalidTag):
+        crypto.unlock(f2, "old")
+
+
+def test_rekey_applies_new_kdf_params():
+    f, vk = crypto.new_vault("pw")
+    params = {"time_cost": 1, "memory_kib": 8192, "parallelism": 1}
+    f2 = crypto.rekey(f, vk, [], "pw", params)
+    assert {k: f2["kdf"][k] for k in params} == params
+    assert crypto.unlock(f2, "pw") == vk
