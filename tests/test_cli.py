@@ -1,5 +1,7 @@
+import pytest
 from typer.testing import CliRunner
 
+from vaultlet import cli
 from vaultlet.cli import app
 
 runner = CliRunner()
@@ -119,3 +121,48 @@ def test_password_only_printed_with_show(tmp_path):
 
 def test_tracebacks_never_show_locals():
     assert app.pretty_exceptions_show_locals is False
+
+
+@pytest.fixture
+def clipboard(monkeypatch):
+    """Fake clipboard; sleep runs `during_wait` instead of waiting."""
+    board = {"text": "", "during_wait": lambda: None}
+    monkeypatch.setattr(cli.pyperclip, "copy", lambda t: board.update(text=t))
+    monkeypatch.setattr(cli.pyperclip, "paste", lambda: board["text"])
+    monkeypatch.setattr(cli.time, "sleep", lambda s: board["during_wait"]())
+    return board
+
+
+def add_entry(tmp_path, secret="s3cret"):
+    path = init(tmp_path)
+    run(path, "add", "Site", input=f"pw\n{secret}\n{secret}\n")
+    return path, run(path, "list", input="pw\n").output.strip().splitlines()[-1].split()[0]
+
+
+def test_copy_puts_password_on_clipboard_then_clears(tmp_path, clipboard):
+    path, short_id = add_entry(tmp_path)
+    seen = []
+    clipboard["during_wait"] = lambda: seen.append(clipboard["text"])
+    r = run(path, "get", short_id, "--copy", input="pw\n")
+    assert r.exit_code == 0, r.output
+    assert seen == ["s3cret"] and clipboard["text"] == ""
+    assert "s3cret" not in r.output and "Clipboard cleared." in r.output
+
+
+def test_copy_leaves_clipboard_alone_if_user_copied_something_else(tmp_path, clipboard):
+    path, short_id = add_entry(tmp_path)
+    clipboard["during_wait"] = lambda: clipboard.update(text="other")
+    r = run(path, "get", short_id, "-c", input="pw\n")
+    assert clipboard["text"] == "other" and "left alone" in r.output
+
+
+def test_ctrl_c_clears_clipboard_immediately(tmp_path, clipboard):
+    path, short_id = add_entry(tmp_path)
+
+    def interrupt():
+        raise KeyboardInterrupt
+
+    clipboard["during_wait"] = interrupt
+    r = run(path, "get", short_id, "--copy", input="pw\n")
+    assert r.exit_code == 0, r.output
+    assert clipboard["text"] == ""
