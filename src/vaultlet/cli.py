@@ -4,9 +4,12 @@ Secrets (master and entry passwords) are only ever read from a hidden prompt,
 never from arguments or environment variables.
 """
 
+import secrets
+import time
 from pathlib import Path
 from typing import Annotated, NoReturn, Optional
 
+import pyperclip
 import typer
 
 from vaultlet import vault
@@ -16,6 +19,7 @@ from vaultlet.generator import generate
 DEFAULT_VAULT = Path.home() / ".vaultlet" / "vault.json"
 UNLOCK_FAILED = "Could not unlock the vault: wrong password or damaged file."
 MASK = "********"
+CLEAR_AFTER = 20  # seconds a copied password stays on the clipboard
 
 # show_locals stays off explicitly: a crash traceback must never dump the vault key or entries.
 app = typer.Typer(help="Vaultlet: a local, encrypted password manager.", no_args_is_help=True,
@@ -48,6 +52,26 @@ def unlock(path: Path) -> tuple[dict, bytes, list[dict]]:
         return vault.open_vault(path, ask_master())
     except (WrongPassword, CorruptVault):
         fail(UNLOCK_FAILED)  # one message for both, so failures reveal nothing
+
+
+def copy_then_clear(value: str, seconds: int = CLEAR_AFTER) -> None:
+    """Copy VALUE, wait, then clear the clipboard only if it still holds VALUE."""
+    # ponytail: blocks the terminal for the wait; move to a detached clearer process if that gets annoying
+    try:
+        pyperclip.copy(value)
+    except pyperclip.PyperclipException:
+        fail("No clipboard available (on Linux, install xclip, xsel or wl-clipboard).")
+    typer.echo(f"Password copied. Clipboard clears in {seconds}s (Ctrl+C to clear now).")
+    try:
+        time.sleep(seconds)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Don't wipe something the user copied in the meantime.
+        unchanged = secrets.compare_digest(pyperclip.paste().encode(), value.encode())
+        if unchanged:
+            pyperclip.copy("")
+    typer.echo("Clipboard cleared." if unchanged else "Clipboard changed since copy; left alone.")
 
 
 def resolve(entries: list[dict], ref: str) -> dict:
@@ -116,6 +140,7 @@ def get(
     ctx: typer.Context,
     entry_id: str,
     show: Annotated[bool, typer.Option("--show", help="Print the password instead of masking it.")] = False,
+    copy: Annotated[bool, typer.Option("--copy", "-c", help=f"Copy the password; clears after {CLEAR_AFTER}s.")] = False,
 ) -> None:
     """Show one entry. The password is masked unless --show is given."""
     _, _, entries = unlock(ctx.obj)
@@ -126,6 +151,8 @@ def get(
     typer.echo(f"password: {e['password'] if show else MASK}")
     typer.echo(f"url:      {e['url']}")
     typer.echo(f"notes:    {e['notes']}")
+    if copy:
+        copy_then_clear(e["password"])
 
 
 @app.command("list")
