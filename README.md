@@ -19,7 +19,7 @@ This is a learning and portfolio project. Keep real credentials in an audited ma
 
 ## Crypto decisions
 
-- **KDF:** Argon2id (`argon2-cffi`), 32-byte KEK, time_cost 3, memory 64 MiB, parallelism 4. Tune upward until unlock takes about 0.5–1 s.
+- **KDF:** Argon2id (`argon2-cffi`), 32-byte KEK, time_cost 3, memory 64 MiB, parallelism 4. Tune upward until unlock takes about 0.5–1 s. A vault below the defaults is re-keyed to them on its next unlock; KDF parameters above 50 passes, 4 GiB or 64 lanes are rejected as corrupt so a hostile file can't stall the machine.
 - **Vault key:** random 32 bytes, wrapped with the KEK via AES-256-GCM. Changing the master password or KDF parameters keeps the vault key, re-wraps it under a fresh salt, and re-seals the entries (the header is in both AADs). Only one Argon2id run is needed.
 - **Nonces:** fresh 96-bit `os.urandom` for every encryption.
 - **AAD:** the header (version and KDF parameters) is authenticated into both ciphertexts, with `key` or `vault` as a purpose suffix.
@@ -36,6 +36,7 @@ vaultlet get <id>                   # password masked
 vaultlet get <id> --copy            # copy password; clipboard clears after 20 s (Ctrl+C clears now)
 vaultlet generate --length 30       # print a password; no vault needed
 vaultlet passwd                     # change the master password (always asks for the current one)
+vaultlet upgrade-kdf --time-cost 4  # stronger Argon2id (never below the defaults)
 vaultlet shell --idle 300           # unlock once; locks and clears the screen after 300 s idle
 ```
 

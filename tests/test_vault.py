@@ -168,3 +168,30 @@ def test_rekey_saves_new_password(tmp_path):
     with pytest.raises(WrongPassword):  # the backup must not keep the old password alive
         vault.unlock(vault.load(str(path) + ".bak"), "old")
     assert vault.unlock(vault.load(str(path) + ".bak"), "new") == vk
+
+
+@pytest.mark.parametrize("name,value", [
+    ("memory_kib", 64 * 1024 * 1024), ("time_cost", 0), ("parallelism", True), ("time_cost", "3"),
+])
+def test_load_rejects_out_of_range_kdf(tmp_path, name, value):
+    path, f, _ = make_file(tmp_path)
+    f["kdf"][name] = value
+    path.write_text(json.dumps(f), encoding="utf-8")
+    with pytest.raises(CorruptVault):
+        vault.load(path)
+
+
+def test_open_vault_upgrades_weak_kdf(tmp_path):
+    path, f, vk = make_file(tmp_path)
+    vault.save(path, crypto.rekey(f, vk, [], "pw", {"time_cost": 1, "memory_kib": 8192, "parallelism": 1}))
+    file, key, _ = vault.open_vault(path, "pw")
+    stored = vault.load(path)["kdf"]
+    assert {k: stored[k] for k in crypto.KDF_DEFAULTS} == crypto.KDF_DEFAULTS
+    assert file["kdf"] == stored and key == vk
+    assert vault.open_vault(path, "pw")[1] == vk
+
+
+def test_open_vault_leaves_default_kdf_alone(tmp_path):
+    path, f, _ = make_file(tmp_path)
+    vault.open_vault(path, "pw")
+    assert vault.load(path) == f

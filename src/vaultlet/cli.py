@@ -51,14 +51,15 @@ def ask_entry_password(gen: bool, length: int, symbols: bool) -> str:
     return typer.prompt("Entry password", hide_input=True, confirmation_prompt=True)
 
 
-def unlock(path: Path, always_prompt: bool = False) -> tuple[dict, bytes, list[dict]]:
+def unlock(path: Path, always_prompt: bool = False,
+           kdf: dict | None = None) -> tuple[dict, bytes, list[dict]]:
     if not path.exists():
         fail(f"No vault at {path}. Run 'vaultlet init' first.")
     try:
         if _session_key is not None and not always_prompt:  # unlocked shell: no prompt, re-read the file
             file = vault.load(path)
             return file, _session_key, vault.read_entries(file, _session_key)
-        return vault.open_vault(path, ask_master())
+        return vault.open_vault(path, ask_master(), kdf)
     except (WrongPassword, CorruptVault):
         fail(UNLOCK_FAILED)  # one message for both, so failures reveal nothing
 
@@ -236,6 +237,25 @@ def passwd(ctx: typer.Context) -> None:
     new = typer.prompt("New master password", hide_input=True, confirmation_prompt=True)
     vault.rekey(path, file, key, entries, new)
     typer.echo("Master password changed.")
+
+
+def kdf_option(name: str, flag: str, help: str):
+    """An Argon2id option that can't go below the defaults (open_vault would raise it back anyway)."""
+    return Annotated[int, typer.Option(flag, min=vault.crypto.KDF_DEFAULTS[name],
+                                       max=vault.KDF_LIMITS[name][1], help=help)]
+
+
+@app.command("upgrade-kdf")
+def upgrade_kdf(
+    ctx: typer.Context,
+    time_cost: kdf_option("time_cost", "--time-cost", "Argon2id passes.") = vault.crypto.KDF_DEFAULTS["time_cost"],
+    memory_kib: kdf_option("memory_kib", "--memory-kib", "Argon2id memory in KiB.") = vault.crypto.KDF_DEFAULTS["memory_kib"],
+    parallelism: kdf_option("parallelism", "--parallelism", "Argon2id lanes.") = vault.crypto.KDF_DEFAULTS["parallelism"],
+) -> None:
+    """Re-key the vault with stronger Argon2id settings. Aim for an unlock of about 0.5-1 s."""
+    kdf = {"time_cost": time_cost, "memory_kib": memory_kib, "parallelism": parallelism}
+    unlock(ctx.obj, always_prompt=True, kdf=kdf)  # also needed in a shell: re-keying needs the password
+    typer.echo(f"KDF set to time_cost={time_cost}, memory_kib={memory_kib}, parallelism={parallelism}.")
 
 
 @app.command()

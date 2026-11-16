@@ -1,3 +1,4 @@
+import json
 import pytest
 from typer.testing import CliRunner
 
@@ -240,3 +241,16 @@ def test_passwd_in_shell_asks_for_current_password(tmp_path, timer):
     assert "wrong password or damaged file" in r.output
     assert "Site" in r.output  # shell stays unlocked; password unchanged
     assert run(path, "list", input="pw\n").exit_code == 0
+
+
+def test_upgrade_kdf_raises_params_and_vault_still_opens(tmp_path):
+    path, _ = add_entry(tmp_path)
+    r = run(path, "upgrade-kdf", "--time-cost", "4", input="pw\n")
+    assert r.exit_code == 0, r.output
+    assert json.loads(path.read_text())["kdf"]["time_cost"] == 4
+    assert "Site" in run(path, "list", input="pw\n").output
+
+
+def test_upgrade_kdf_refuses_weaker_than_defaults(tmp_path):
+    path = init(tmp_path)
+    assert run(path, "upgrade-kdf", "--memory-kib", "1024", input="pw\n").exit_code == 2

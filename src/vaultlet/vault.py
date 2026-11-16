@@ -13,6 +13,19 @@ from vaultlet.errors import CorruptVault, EntryNotFound, WrongPassword
 
 REQUIRED_FIELDS = ("version", "kdf", "wrapped_key", "vault")
 ENTRY_FIELDS = ("title", "username", "password", "url", "notes")
+# Upper bounds stop a hostile vault or export file from demanding e.g. 64 GiB or hours of Argon2id.
+KDF_LIMITS = {"time_cost": (1, 50), "memory_kib": (8, 4 * 1024 * 1024), "parallelism": (1, 64)}
+
+
+def check_kdf(kdf: object) -> None:
+    if not isinstance(kdf, dict):
+        raise CorruptVault("vault KDF parameters are malformed")
+    for name, (low, high) in KDF_LIMITS.items():
+        value = kdf.get(name)
+        if type(value) is not int or not low <= value <= high:
+            raise CorruptVault(f"vault KDF parameter {name} is out of range")
+    if kdf["memory_kib"] < 8 * kdf["parallelism"]:  # Argon2 minimum
+        raise CorruptVault("vault KDF memory is too small for its parallelism")
 
 
 def load(path: str | Path) -> dict:
@@ -24,6 +37,7 @@ def load(path: str | Path) -> dict:
         raise CorruptVault("vault file is not valid JSON") from exc
     if not isinstance(data, dict) or any(k not in data for k in REQUIRED_FIELDS):
         raise CorruptVault("vault file is missing required fields")
+    check_kdf(data["kdf"])
     return data
 
 
@@ -73,11 +87,21 @@ def create(path: str | Path, password: str) -> None:
     save(path, file)
 
 
-def open_vault(path: str | Path, password: str) -> tuple[dict, bytes, list[dict]]:
-    """Load, unlock and decrypt. Returns (file, vault_key, entries)."""
+def open_vault(path: str | Path, password: str,
+               kdf: dict | None = None) -> tuple[dict, bytes, list[dict]]:
+    """Load, unlock and decrypt. Returns (file, vault_key, entries).
+
+    Re-keys to KDF if given; otherwise raises any parameter below crypto.KDF_DEFAULTS up to it,
+    so raising the defaults later upgrades every vault the next time it is opened.
+    """
     file = load(path)
     vault_key = unlock(file, password)
-    return file, vault_key, read_entries(file, vault_key)
+    entries = read_entries(file, vault_key)
+    current = {k: file["kdf"][k] for k in crypto.KDF_DEFAULTS}
+    target = kdf or {k: max(v, crypto.KDF_DEFAULTS[k]) for k, v in current.items()}
+    if target != current:
+        file = rekey(path, file, vault_key, entries, password, target)
+    return file, vault_key, entries
 
 
 # Entry operations work on the decrypted list in memory. Callers persist with persist().
