@@ -157,3 +157,12 @@ def test_persist_roundtrip_through_file(tmp_path):
     loaded = vault.load(path)
     key = vault.unlock(loaded, "pw")
     assert vault.read_entries(loaded, key) == entries
+
+
+def test_rekey_saves_new_password(tmp_path):
+    path, f, vk = make_file(tmp_path, password="old")
+    vault.rekey(path, f, vk, [], "new")
+    assert vault.open_vault(path, "new")[1] == vk
+    with pytest.raises(WrongPassword):
+        vault.open_vault(path, "old")
+    assert vault.unlock(vault.load(str(path) + ".bak"), "old") == vk

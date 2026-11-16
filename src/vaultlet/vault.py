@@ -124,3 +124,11 @@ def persist(path: str | Path, file: dict, vault_key: bytes, entries: list[dict])
     new_file = crypto.write_entries(file, vault_key, entries)
     save(path, new_file)
     return new_file
+
+
+def rekey(path: str | Path, file: dict, vault_key: bytes, entries: list[dict],
+          password: str, kdf: dict | None = None) -> dict:
+    """Re-key the vault under a new password and/or KDF params and save it atomically."""
+    new_file = crypto.rekey(file, vault_key, entries, password, kdf)
+    save(path, new_file)
+    return new_file
