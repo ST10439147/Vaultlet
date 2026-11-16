@@ -4,7 +4,10 @@ Secrets (master and entry passwords) are only ever read from a hidden prompt,
 never from arguments or environment variables.
 """
 
+import os
 import secrets
+import shlex
+import threading
 import time
 from pathlib import Path
 from typing import Annotated, NoReturn, Optional
@@ -20,6 +23,9 @@ DEFAULT_VAULT = Path.home() / ".vaultlet" / "vault.json"
 UNLOCK_FAILED = "Could not unlock the vault: wrong password or damaged file."
 MASK = "********"
 CLEAR_AFTER = 20  # seconds a copied password stays on the clipboard
+IDLE_LOCK = 300  # seconds without input before `shell` locks
+
+_session_key: bytes | None = None  # set only while `vaultlet shell` is unlocked
 
 # show_locals stays off explicitly: a crash traceback must never dump the vault key or entries.
 app = typer.Typer(help="Vaultlet: a local, encrypted password manager.", no_args_is_help=True,
@@ -49,9 +55,16 @@ def unlock(path: Path) -> tuple[dict, bytes, list[dict]]:
     if not path.exists():
         fail(f"No vault at {path}. Run 'vaultlet init' first.")
     try:
+        if _session_key is not None:  # inside an unlocked shell: no prompt, re-read the file
+            file = vault.load(path)
+            return file, _session_key, vault.read_entries(file, _session_key)
         return vault.open_vault(path, ask_master())
     except (WrongPassword, CorruptVault):
         fail(UNLOCK_FAILED)  # one message for both, so failures reveal nothing
+
+
+def clear_screen() -> None:
+    os.system("cls" if os.name == "nt" else "clear")
 
 
 def copy_then_clear(value: str, seconds: int = CLEAR_AFTER) -> None:
@@ -212,3 +225,63 @@ def delete(
     vault.delete(entries, entry["id"])
     vault.persist(path, file, key, entries)
     typer.echo(f"Deleted {entry['title']}")
+
+
+@app.command()
+def shell(
+    ctx: typer.Context,
+    idle: Annotated[int, typer.Option("--idle", min=10, help="Lock after this many seconds without input.")] = IDLE_LOCK,
+) -> None:
+    """Unlock once, then run commands interactively. Locks itself after --idle seconds without input."""
+    global _session_key
+    path: Path = ctx.obj
+    command = typer.main.get_command(app)
+
+    def lock() -> None:
+        global _session_key
+        # ponytail: drops the reference only; Python can't reliably wipe the key bytes (see README threat model)
+        _session_key = None
+        clear_screen()
+        typer.echo(f"Locked after {idle}s idle. Enter a command to unlock.")
+
+    _session_key = unlock(path)[1]
+    typer.echo("Unlocked. Type a command (e.g. list, get <id> --copy) or 'exit'.")
+    try:
+        while True:
+            timer = threading.Timer(idle, lock)  # only runs while waiting at the prompt
+            timer.daemon = True
+            timer.start()
+            try:
+                line = input("vaultlet> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            finally:
+                timer.cancel()
+            if line in ("exit", "quit"):
+                break
+            if not line:
+                continue
+            if _session_key is None:
+                try:
+                    _session_key = unlock(path)[1]
+                except typer.Exit:
+                    continue  # unlock() already printed why
+            try:
+                args = shlex.split(line)
+            except ValueError as exc:
+                typer.echo(f"Error: {exc}", err=True)
+                continue
+            if args[0] in ("shell", "init"):
+                typer.echo(f"'{args[0]}' isn't available inside the shell.", err=True)
+                continue
+            try:
+                command.main(["--vault", str(path), *args], prog_name="vaultlet", standalone_mode=False)
+            except typer.Abort:
+                typer.echo("Aborted.")
+            except typer.TyperException as exc:
+                typer.echo(f"Error: {exc}", err=True)
+    except typer.Abort:  # Ctrl+C at the unlock prompt
+        pass
+    finally:
+        _session_key = None
+    typer.echo("Locked. Bye.")

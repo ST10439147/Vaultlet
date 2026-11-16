@@ -166,3 +166,53 @@ def test_ctrl_c_clears_clipboard_immediately(tmp_path, clipboard):
     r = run(path, "get", short_id, "--copy", input="pw\n")
     assert r.exit_code == 0, r.output
     assert clipboard["text"] == ""
+
+
+class FakeTimer:
+    """Stands in for threading.Timer. fire=True means the idle time passes before every input."""
+    fire = False
+
+    def __init__(self, interval, fn):
+        self.fn = fn
+
+    def start(self):
+        if self.fire:
+            self.fn()
+
+    def cancel(self):
+        pass
+
+
+@pytest.fixture
+def timer(monkeypatch):
+    FakeTimer.fire = False
+    monkeypatch.setattr(cli.threading, "Timer", FakeTimer)
+    monkeypatch.setattr(cli, "clear_screen", lambda: None)
+    return FakeTimer
+
+
+def test_shell_unlocks_once_for_many_commands(tmp_path, timer):
+    path = init(tmp_path)
+    r = run(path, "shell", input="pw\nadd Site\ns3\ns3\nsearch site\nbogus\nexit\n")
+    assert r.exit_code == 0, r.output
+    assert r.output.count("Master password") == 1
+    assert "Added Site" in r.output and "No such command" in r.output
+    assert cli._session_key is None
+
+
+def test_shell_locks_when_idle_and_asks_again(tmp_path, timer):
+    path, _ = add_entry(tmp_path)
+    timer.fire = True
+    r = run(path, "shell", input="pw\nlist\npw\nexit\n")
+    assert r.exit_code == 0, r.output
+    assert "Locked after" in r.output and r.output.count("Master password") == 2
+    assert "Site" in r.output
+
+
+def test_shell_stays_locked_on_wrong_password(tmp_path, timer):
+    path, _ = add_entry(tmp_path)
+    timer.fire = True
+    r = run(path, "shell", input="pw\nlist\nwrong\nexit\n")
+    assert "wrong password or damaged file" in r.output
+    assert "Site" not in r.output
+    assert cli._session_key is None
