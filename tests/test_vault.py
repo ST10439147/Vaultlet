@@ -165,4 +165,88 @@ def test_rekey_saves_new_password(tmp_path):
     assert vault.open_vault(path, "new")[1] == vk
     with pytest.raises(WrongPassword):
         vault.open_vault(path, "old")
-    assert vault.unlock(vault.load(str(path) + ".bak"), "old") == vk
+    with pytest.raises(WrongPassword):  # the backup must not keep the old password alive
+        vault.unlock(vault.load(str(path) + ".bak"), "old")
+    assert vault.unlock(vault.load(str(path) + ".bak"), "new") == vk
+
+
+@pytest.mark.parametrize("name,value", [
+    ("memory_kib", 64 * 1024 * 1024), ("time_cost", 0), ("parallelism", True), ("time_cost", "3"),
+])
+def test_load_rejects_out_of_range_kdf(tmp_path, name, value):
+    path, f, _ = make_file(tmp_path)
+    f["kdf"][name] = value
+    path.write_text(json.dumps(f), encoding="utf-8")
+    with pytest.raises(CorruptVault):
+        vault.load(path)
+
+
+def test_open_vault_upgrades_weak_kdf(tmp_path):
+    path, f, vk = make_file(tmp_path)
+    vault.save(path, crypto.rekey(f, vk, [], "pw", {"time_cost": 1, "memory_kib": 8192, "parallelism": 1}))
+    file, key, _ = vault.open_vault(path, "pw")
+    stored = vault.load(path)["kdf"]
+    assert {k: stored[k] for k in crypto.KDF_DEFAULTS} == crypto.KDF_DEFAULTS
+    assert file["kdf"] == stored and key == vk
+    assert vault.open_vault(path, "pw")[1] == vk
+
+
+def test_open_vault_leaves_default_kdf_alone(tmp_path):
+    path, f, _ = make_file(tmp_path)
+    vault.open_vault(path, "pw")
+    assert vault.load(path) == f
+
+
+def test_create_with_entries_uses_fresh_key(tmp_path):
+    path, f, vk = make_file(tmp_path)
+    out = tmp_path / "export.json"
+    vault.create(out, "exp", [{"id": "a", "title": "T"}])
+    file, key, entries = vault.open_vault(out, "exp")
+    assert entries == [{"id": "a", "title": "T"}]
+    assert key != vk and file["kdf"]["salt"] != f["kdf"]["salt"]
+
+
+def test_merge_skips_existing_and_duplicate_ids():
+    entries = []
+    vault.add(entries, title="Keep")
+    mine = dict(entries[0])
+    other = {"id": "x" * 32, "title": "New", "username": "", "password": "p", "url": "", "notes": ""}
+    assert vault.merge(entries, [mine, other, dict(other)]) == 1
+    assert [e["title"] for e in entries] == ["Keep", "New"]
+
+
+@pytest.mark.parametrize("incoming", [{"id": "a"}, [{"id": 1}], ["str"], [{"id": "a", "title": "t"}]])
+def test_merge_rejects_malformed_entries(incoming):
+    with pytest.raises(CorruptVault):
+        vault.merge([], incoming)
+
+
+CHROME_CSV = "name,url,username,password,note\nGitHub,https://github.com/,me,p1,hi\n,https://mail.example.com/login,me,p2,\n"
+FIREFOX_CSV = ('url,username,password,httpRealm,formActionOrigin,guid,timeCreated\n'
+               'https://site.example,"a,b","p""q",,,{1},0\n')
+
+
+def test_import_csv_chrome_titles_and_notes():
+    entries = []
+    assert vault.import_csv(entries, CHROME_CSV) == (2, 0)
+    gh, mail = entries
+    assert (gh["title"], gh["notes"], gh["password"]) == ("GitHub", "hi", "p1")
+    assert mail["title"] == "mail.example.com"
+
+
+def test_import_csv_firefox_quoting():
+    entries = []
+    vault.import_csv(entries, FIREFOX_CSV)
+    assert (entries[0]["title"], entries[0]["username"], entries[0]["password"]) == ("site.example", "a,b", 'p"q')
+
+
+def test_import_csv_skips_duplicates_and_blank_rows():
+    entries = []
+    vault.import_csv(entries, CHROME_CSV)
+    assert vault.import_csv(entries, CHROME_CSV + ",,,,\n") == (0, 2)
+    assert len(entries) == 2
+
+
+def test_import_csv_rejects_missing_columns():
+    with pytest.raises(ValueError, match="password"):
+        vault.import_csv([], "name,url,username\nx,y,z\n")

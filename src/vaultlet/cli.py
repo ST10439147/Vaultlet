@@ -4,6 +4,7 @@ Secrets (master and entry passwords) are only ever read from a hidden prompt,
 never from arguments or environment variables.
 """
 
+import csv
 import os
 import secrets
 import shlex
@@ -51,14 +52,15 @@ def ask_entry_password(gen: bool, length: int, symbols: bool) -> str:
     return typer.prompt("Entry password", hide_input=True, confirmation_prompt=True)
 
 
-def unlock(path: Path) -> tuple[dict, bytes, list[dict]]:
+def unlock(path: Path, always_prompt: bool = False,
+           kdf: dict | None = None) -> tuple[dict, bytes, list[dict]]:
     if not path.exists():
         fail(f"No vault at {path}. Run 'vaultlet init' first.")
     try:
-        if _session_key is not None:  # inside an unlocked shell: no prompt, re-read the file
+        if _session_key is not None and not always_prompt:  # unlocked shell: no prompt, re-read the file
             file = vault.load(path)
             return file, _session_key, vault.read_entries(file, _session_key)
-        return vault.open_vault(path, ask_master())
+        return vault.open_vault(path, ask_master(), kdf)
     except (WrongPassword, CorruptVault):
         fail(UNLOCK_FAILED)  # one message for both, so failures reveal nothing
 
@@ -93,6 +95,14 @@ def resolve(entries: list[dict], ref: str) -> dict:
     if len(matches) == 1:
         return matches[0]
     fail("No entry matches that id." if not matches else "That id matches several entries; type more of it.")
+
+
+def split_line(line: str) -> list[str]:
+    """Split a shell line on whitespace with quote support, but keep backslashes (Windows paths)."""
+    lexer = shlex.shlex(line, posix=True)
+    lexer.whitespace_split = True
+    lexer.escape = ""
+    return list(lexer)
 
 
 def print_rows(entries: list[dict], empty: str) -> None:
@@ -228,6 +238,85 @@ def delete(
 
 
 @app.command()
+def passwd(ctx: typer.Context) -> None:
+    """Change the master password. Entries and the vault key stay the same."""
+    path: Path = ctx.obj
+    # Always ask for the current password, even in an unlocked shell, so walk-up access can't change it.
+    file, key, entries = unlock(path, always_prompt=True)
+    new = typer.prompt("New master password", hide_input=True, confirmation_prompt=True)
+    vault.rekey(path, file, key, entries, new)
+    typer.echo("Master password changed.")
+
+
+@app.command()
+def export(ctx: typer.Context, out: Path) -> None:
+    """Write all entries to OUT as a separate vault locked with its own export password."""
+    if out.exists():
+        fail(f"{out} already exists; pick a new file name.")
+    # Always ask for the master password, so walk-up access to a shell can't copy the vault out.
+    _, _, entries = unlock(ctx.obj, always_prompt=True)
+    password = typer.prompt("Export password", hide_input=True, confirmation_prompt=True)
+    vault.create(out, password, entries)
+    typer.echo(f"Exported {len(entries)} entries to {out}. It opens with the export password, "
+               f"e.g. 'vaultlet --vault {out} list'.")
+
+
+@app.command("import-vault")
+def import_vault(ctx: typer.Context, source: Path) -> None:
+    """Add entries from an exported vault file. Entries whose id already exists are skipped."""
+    if not source.exists():
+        fail(f"No file at {source}.")
+    path: Path = ctx.obj
+    file, key, entries = unlock(path)
+    try:
+        src = vault.load(source)
+        incoming = vault.read_entries(src, vault.unlock(src, typer.prompt("Export password", hide_input=True)))
+        added = vault.merge(entries, incoming)
+    except (WrongPassword, CorruptVault):
+        fail("Could not open the export: wrong password or damaged file.")
+    vault.persist(path, file, key, entries)
+    typer.echo(f"Imported {added} entries; skipped {len(incoming) - added} already present.")
+
+
+@app.command("import-csv")
+def import_csv(ctx: typer.Context, source: Path) -> None:
+    """Add entries from a Chrome, Edge or Firefox password export (CSV)."""
+    if not source.exists():
+        fail(f"No file at {source}.")
+    path: Path = ctx.obj
+    file, key, entries = unlock(path)
+    try:
+        # utf-8-sig drops the BOM some browsers write; newline="" lets csv handle quoted line breaks
+        with source.open(encoding="utf-8-sig", newline="") as handle:
+            added, skipped = vault.import_csv(entries, handle.read())
+    except (ValueError, csv.Error) as exc:  # UnicodeDecodeError is a ValueError
+        fail(f"Could not import {source}: {exc}")
+    vault.persist(path, file, key, entries)
+    typer.echo(f"Imported {added} entries; skipped {skipped} duplicates.")
+    typer.echo(f"WARNING: {source} holds every password in plain text. Delete it now, "
+               "and empty the Recycle Bin/Trash.", err=True)
+
+
+def kdf_option(name: str, flag: str, help: str):
+    """An Argon2id option that can't go below the defaults (open_vault would raise it back anyway)."""
+    return Annotated[int, typer.Option(flag, min=vault.crypto.KDF_DEFAULTS[name],
+                                       max=vault.KDF_LIMITS[name][1], help=help)]
+
+
+@app.command("upgrade-kdf")
+def upgrade_kdf(
+    ctx: typer.Context,
+    time_cost: kdf_option("time_cost", "--time-cost", "Argon2id passes.") = vault.crypto.KDF_DEFAULTS["time_cost"],
+    memory_kib: kdf_option("memory_kib", "--memory-kib", "Argon2id memory in KiB.") = vault.crypto.KDF_DEFAULTS["memory_kib"],
+    parallelism: kdf_option("parallelism", "--parallelism", "Argon2id lanes.") = vault.crypto.KDF_DEFAULTS["parallelism"],
+) -> None:
+    """Re-key the vault with stronger Argon2id settings. Aim for an unlock of about 0.5-1 s."""
+    kdf = {"time_cost": time_cost, "memory_kib": memory_kib, "parallelism": parallelism}
+    unlock(ctx.obj, always_prompt=True, kdf=kdf)  # also needed in a shell: re-keying needs the password
+    typer.echo(f"KDF set to time_cost={time_cost}, memory_kib={memory_kib}, parallelism={parallelism}.")
+
+
+@app.command()
 def shell(
     ctx: typer.Context,
     idle: Annotated[int, typer.Option("--idle", min=10, help="Lock after this many seconds without input.")] = IDLE_LOCK,
@@ -267,7 +356,7 @@ def shell(
                 except typer.Exit:
                     continue  # unlock() already printed why
             try:
-                args = shlex.split(line)
+                args = split_line(line)
             except ValueError as exc:
                 typer.echo(f"Error: {exc}", err=True)
                 continue
