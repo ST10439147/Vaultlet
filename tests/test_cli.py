@@ -98,3 +98,24 @@ def test_add_generated_without_symbols(tmp_path):
     short_id = run(path, "list", input="pw\n").output.strip().splitlines()[-1].split()[0]
     pw = field(run(path, "get", short_id, "--show", input="pw\n").output, "password")
     assert len(pw) == 20 and pw.isalnum()
+
+
+def test_password_only_printed_with_show(tmp_path):
+    secret, master = "Zq9-unique-secret", "Mst-unique-master"
+    path = init(tmp_path, master)
+    m = f"{master}\n"
+    outputs = [run(path, "add", "Site", input=f"{m}{secret}\n{secret}\n").output]
+    short_id = run(path, "list", input=m).output.strip().splitlines()[-1].split()[0]
+    outputs += [
+        run(path, "list", input=m).output,
+        run(path, "search", "site", input=m).output,
+        run(path, "get", short_id, input=m).output,
+        run(path, "edit", short_id, "--notes", "n", input=m).output,
+        run(path, "delete", short_id, "--yes", input=m).output,
+    ]
+    for out in outputs:
+        assert secret not in out and master not in out
+
+
+def test_tracebacks_never_show_locals():
+    assert app.pretty_exceptions_show_locals is False

@@ -17,7 +17,9 @@ DEFAULT_VAULT = Path.home() / ".vaultlet" / "vault.json"
 UNLOCK_FAILED = "Could not unlock the vault: wrong password or damaged file."
 MASK = "********"
 
-app = typer.Typer(help="Vaultlet: a local, encrypted password manager.", no_args_is_help=True)
+# show_locals stays off explicitly: a crash traceback must never dump the vault key or entries.
+app = typer.Typer(help="Vaultlet: a local, encrypted password manager.", no_args_is_help=True,
+                  pretty_exceptions_show_locals=False)
 
 Length = Annotated[int, typer.Option("--length", min=4, help="Length for --generate.")]
 Generate = Annotated[bool, typer.Option("--generate", "-g", help="Generate a strong password.")]
