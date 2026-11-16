@@ -128,7 +128,12 @@ def persist(path: str | Path, file: dict, vault_key: bytes, entries: list[dict])
 
 def rekey(path: str | Path, file: dict, vault_key: bytes, entries: list[dict],
           password: str, kdf: dict | None = None) -> dict:
-    """Re-key the vault under a new password and/or KDF params and save it atomically."""
+    """Re-key the vault under a new password and/or KDF params and save it atomically.
+
+    The .bak is then replaced too, so the old password (or weak KDF) no longer opens any copy.
+    """
     new_file = crypto.rekey(file, vault_key, entries, password, kdf)
     save(path, new_file)
+    # ponytail: overwrite, not a secure wipe; SSDs and filesystem snapshots can keep old blocks
+    shutil.copyfile(path, Path(path).with_name(Path(path).name + ".bak"))
     return new_file

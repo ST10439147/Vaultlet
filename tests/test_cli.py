@@ -216,3 +216,27 @@ def test_shell_stays_locked_on_wrong_password(tmp_path, timer):
     assert "wrong password or damaged file" in r.output
     assert "Site" not in r.output
     assert cli._session_key is None
+
+
+def test_passwd_changes_master_password(tmp_path):
+    path, _ = add_entry(tmp_path)
+    r = run(path, "passwd", input="pw\nnew\nnew\n")
+    assert r.exit_code == 0, r.output
+    assert "Site" in run(path, "list", input="new\n").output
+    assert "wrong password" in run(path, "list", input="pw\n").output
+
+
+def test_passwd_rejects_wrong_current_or_mismatch(tmp_path):
+    path = init(tmp_path)
+    assert run(path, "passwd", input="nope\n").exit_code == 1
+    r = run(path, "passwd", input="pw\na\nb\nc\nc\n")  # mismatch, then retry
+    assert r.exit_code == 0 and "do not match" in r.output.lower()
+    assert run(path, "list", input="c\n").exit_code == 0
+
+
+def test_passwd_in_shell_asks_for_current_password(tmp_path, timer):
+    path, _ = add_entry(tmp_path)
+    r = run(path, "shell", input="pw\npasswd\nwrong\nlist\nexit\n")
+    assert "wrong password or damaged file" in r.output
+    assert "Site" in r.output  # shell stays unlocked; password unchanged
+    assert run(path, "list", input="pw\n").exit_code == 0

@@ -51,11 +51,11 @@ def ask_entry_password(gen: bool, length: int, symbols: bool) -> str:
     return typer.prompt("Entry password", hide_input=True, confirmation_prompt=True)
 
 
-def unlock(path: Path) -> tuple[dict, bytes, list[dict]]:
+def unlock(path: Path, always_prompt: bool = False) -> tuple[dict, bytes, list[dict]]:
     if not path.exists():
         fail(f"No vault at {path}. Run 'vaultlet init' first.")
     try:
-        if _session_key is not None:  # inside an unlocked shell: no prompt, re-read the file
+        if _session_key is not None and not always_prompt:  # unlocked shell: no prompt, re-read the file
             file = vault.load(path)
             return file, _session_key, vault.read_entries(file, _session_key)
         return vault.open_vault(path, ask_master())
@@ -225,6 +225,17 @@ def delete(
     vault.delete(entries, entry["id"])
     vault.persist(path, file, key, entries)
     typer.echo(f"Deleted {entry['title']}")
+
+
+@app.command()
+def passwd(ctx: typer.Context) -> None:
+    """Change the master password. Entries and the vault key stay the same."""
+    path: Path = ctx.obj
+    # Always ask for the current password, even in an unlocked shell, so walk-up access can't change it.
+    file, key, entries = unlock(path, always_prompt=True)
+    new = typer.prompt("New master password", hide_input=True, confirmation_prompt=True)
+    vault.rekey(path, file, key, entries, new)
+    typer.echo("Master password changed.")
 
 
 @app.command()

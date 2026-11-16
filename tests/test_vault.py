@@ -165,4 +165,6 @@ def test_rekey_saves_new_password(tmp_path):
     assert vault.open_vault(path, "new")[1] == vk
     with pytest.raises(WrongPassword):
         vault.open_vault(path, "old")
-    assert vault.unlock(vault.load(str(path) + ".bak"), "old") == vk
+    with pytest.raises(WrongPassword):  # the backup must not keep the old password alive
+        vault.unlock(vault.load(str(path) + ".bak"), "old")
+    assert vault.unlock(vault.load(str(path) + ".bak"), "new") == vk

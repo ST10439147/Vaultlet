@@ -35,6 +35,7 @@ vaultlet list                       # ids, titles, usernames; never passwords
 vaultlet get <id>                   # password masked
 vaultlet get <id> --copy            # copy password; clipboard clears after 20 s (Ctrl+C clears now)
 vaultlet generate --length 30       # print a password; no vault needed
+vaultlet passwd                     # change the master password (always asks for the current one)
 vaultlet shell --idle 300           # unlock once; locks and clears the screen after 300 s idle
 ```
 
