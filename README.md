@@ -20,7 +20,7 @@ This is a learning and portfolio project. Keep real credentials in an audited ma
 ## Crypto decisions
 
 - **KDF:** Argon2id (`argon2-cffi`), 32-byte KEK, time_cost 3, memory 64 MiB, parallelism 4. Tune upward until unlock takes about 0.5–1 s.
-- **Vault key:** random 32 bytes, wrapped with the KEK via AES-256-GCM. Changing the master password re-wraps only the vault key.
+- **Vault key:** random 32 bytes, wrapped with the KEK via AES-256-GCM. Changing the master password or KDF parameters keeps the vault key, re-wraps it under a fresh salt, and re-seals the entries (the header is in both AADs). Only one Argon2id run is needed.
 - **Nonces:** fresh 96-bit `os.urandom` for every encryption.
 - **AAD:** the header (version and KDF parameters) is authenticated into both ciphertexts, with `key` or `vault` as a purpose suffix.
 - **Passwords:** Unicode NFKC-normalised before derivation.
