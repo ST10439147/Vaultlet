@@ -1,5 +1,7 @@
+import pytest
 from typer.testing import CliRunner
 
+from vaultlet import cli
 from vaultlet.cli import app
 
 runner = CliRunner()
@@ -82,3 +84,135 @@ def test_unknown_id_and_empty_edit_fail(tmp_path):
     path = init(tmp_path)
     assert run(path, "get", "deadbeef", input="pw\n").exit_code == 1
     assert run(path, "edit", "deadbeef").exit_code == 1
+
+
+def test_generate_command_needs_no_vault(tmp_path):
+    r = run(tmp_path / "missing.json", "generate", "--length", "30", "--no-symbols")
+    assert r.exit_code == 0, r.output
+    pw = r.output.strip()
+    assert len(pw) == 30 and pw.isalnum()
+    assert not (tmp_path / "missing.json").exists()
+
+
+def test_add_generated_without_symbols(tmp_path):
+    path = init(tmp_path)
+    run(path, "add", "Bank", "-g", "--no-symbols", input="pw\n")
+    short_id = run(path, "list", input="pw\n").output.strip().splitlines()[-1].split()[0]
+    pw = field(run(path, "get", short_id, "--show", input="pw\n").output, "password")
+    assert len(pw) == 20 and pw.isalnum()
+
+
+def test_password_only_printed_with_show(tmp_path):
+    secret, master = "Zq9-unique-secret", "Mst-unique-master"
+    path = init(tmp_path, master)
+    m = f"{master}\n"
+    outputs = [run(path, "add", "Site", input=f"{m}{secret}\n{secret}\n").output]
+    short_id = run(path, "list", input=m).output.strip().splitlines()[-1].split()[0]
+    outputs += [
+        run(path, "list", input=m).output,
+        run(path, "search", "site", input=m).output,
+        run(path, "get", short_id, input=m).output,
+        run(path, "edit", short_id, "--notes", "n", input=m).output,
+        run(path, "delete", short_id, "--yes", input=m).output,
+    ]
+    for out in outputs:
+        assert secret not in out and master not in out
+
+
+def test_tracebacks_never_show_locals():
+    assert app.pretty_exceptions_show_locals is False
+
+
+@pytest.fixture
+def clipboard(monkeypatch):
+    """Fake clipboard; sleep runs `during_wait` instead of waiting."""
+    board = {"text": "", "during_wait": lambda: None}
+    monkeypatch.setattr(cli.pyperclip, "copy", lambda t: board.update(text=t))
+    monkeypatch.setattr(cli.pyperclip, "paste", lambda: board["text"])
+    monkeypatch.setattr(cli.time, "sleep", lambda s: board["during_wait"]())
+    return board
+
+
+def add_entry(tmp_path, secret="s3cret"):
+    path = init(tmp_path)
+    run(path, "add", "Site", input=f"pw\n{secret}\n{secret}\n")
+    return path, run(path, "list", input="pw\n").output.strip().splitlines()[-1].split()[0]
+
+
+def test_copy_puts_password_on_clipboard_then_clears(tmp_path, clipboard):
+    path, short_id = add_entry(tmp_path)
+    seen = []
+    clipboard["during_wait"] = lambda: seen.append(clipboard["text"])
+    r = run(path, "get", short_id, "--copy", input="pw\n")
+    assert r.exit_code == 0, r.output
+    assert seen == ["s3cret"] and clipboard["text"] == ""
+    assert "s3cret" not in r.output and "Clipboard cleared." in r.output
+
+
+def test_copy_leaves_clipboard_alone_if_user_copied_something_else(tmp_path, clipboard):
+    path, short_id = add_entry(tmp_path)
+    clipboard["during_wait"] = lambda: clipboard.update(text="other")
+    r = run(path, "get", short_id, "-c", input="pw\n")
+    assert clipboard["text"] == "other" and "left alone" in r.output
+
+
+def test_ctrl_c_clears_clipboard_immediately(tmp_path, clipboard):
+    path, short_id = add_entry(tmp_path)
+
+    def interrupt():
+        raise KeyboardInterrupt
+
+    clipboard["during_wait"] = interrupt
+    r = run(path, "get", short_id, "--copy", input="pw\n")
+    assert r.exit_code == 0, r.output
+    assert clipboard["text"] == ""
+
+
+class FakeTimer:
+    """Stands in for threading.Timer. fire=True means the idle time passes before every input."""
+    fire = False
+
+    def __init__(self, interval, fn):
+        self.fn = fn
+
+    def start(self):
+        if self.fire:
+            self.fn()
+
+    def cancel(self):
+        pass
+
+
+@pytest.fixture
+def timer(monkeypatch):
+    FakeTimer.fire = False
+    monkeypatch.setattr(cli.threading, "Timer", FakeTimer)
+    monkeypatch.setattr(cli, "clear_screen", lambda: None)
+    return FakeTimer
+
+
+def test_shell_unlocks_once_for_many_commands(tmp_path, timer):
+    path = init(tmp_path)
+    r = run(path, "shell", input="pw\nadd Site\ns3\ns3\nsearch site\nbogus\nexit\n")
+    assert r.exit_code == 0, r.output
+    assert r.output.count("Master password") == 1
+    assert "Added Site" in r.output and "No such command" in r.output
+    assert cli._session_key is None
+
+
+def test_shell_locks_when_idle_and_asks_again(tmp_path, timer):
+    path, _ = add_entry(tmp_path)
+    timer.fire = True
+    r = run(path, "shell", input="pw\nlist\npw\nexit\n")
+    assert r.exit_code == 0, r.output
+    assert "Locked after" in r.output and r.output.count("Master password") == 2
+    assert "Site" in r.output
+
+
+def test_shell_stays_locked_on_wrong_password(tmp_path, timer):
+    path, _ = add_entry(tmp_path)
+    timer.fire = True
+    r = run(path, "shell", input="pw\nlist\nwrong\nexit\n")
+    assert "wrong password or damaged file" in r.output
+    assert "Site" not in r.output
+    assert cli._session_key is None

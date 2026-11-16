@@ -4,9 +4,15 @@ Secrets (master and entry passwords) are only ever read from a hidden prompt,
 never from arguments or environment variables.
 """
 
+import os
+import secrets
+import shlex
+import threading
+import time
 from pathlib import Path
 from typing import Annotated, NoReturn, Optional
 
+import pyperclip
 import typer
 
 from vaultlet import vault
@@ -16,11 +22,18 @@ from vaultlet.generator import generate
 DEFAULT_VAULT = Path.home() / ".vaultlet" / "vault.json"
 UNLOCK_FAILED = "Could not unlock the vault: wrong password or damaged file."
 MASK = "********"
+CLEAR_AFTER = 20  # seconds a copied password stays on the clipboard
+IDLE_LOCK = 300  # seconds without input before `shell` locks
 
-app = typer.Typer(help="Vaultlet: a local, encrypted password manager.", no_args_is_help=True)
+_session_key: bytes | None = None  # set only while `vaultlet shell` is unlocked
+
+# show_locals stays off explicitly: a crash traceback must never dump the vault key or entries.
+app = typer.Typer(help="Vaultlet: a local, encrypted password manager.", no_args_is_help=True,
+                  pretty_exceptions_show_locals=False)
 
 Length = Annotated[int, typer.Option("--length", min=4, help="Length for --generate.")]
 Generate = Annotated[bool, typer.Option("--generate", "-g", help="Generate a strong password.")]
+Symbols = Annotated[bool, typer.Option("--symbols/--no-symbols", help="Include symbols when generating.")]
 
 
 def fail(message: str) -> NoReturn:
@@ -32,9 +45,9 @@ def ask_master(confirm: bool = False) -> str:
     return typer.prompt("Master password", hide_input=True, confirmation_prompt=confirm)
 
 
-def ask_entry_password(gen: bool, length: int) -> str:
+def ask_entry_password(gen: bool, length: int, symbols: bool) -> str:
     if gen:
-        return generate(length)
+        return generate(length, symbols)
     return typer.prompt("Entry password", hide_input=True, confirmation_prompt=True)
 
 
@@ -42,9 +55,36 @@ def unlock(path: Path) -> tuple[dict, bytes, list[dict]]:
     if not path.exists():
         fail(f"No vault at {path}. Run 'vaultlet init' first.")
     try:
+        if _session_key is not None:  # inside an unlocked shell: no prompt, re-read the file
+            file = vault.load(path)
+            return file, _session_key, vault.read_entries(file, _session_key)
         return vault.open_vault(path, ask_master())
     except (WrongPassword, CorruptVault):
         fail(UNLOCK_FAILED)  # one message for both, so failures reveal nothing
+
+
+def clear_screen() -> None:
+    os.system("cls" if os.name == "nt" else "clear")
+
+
+def copy_then_clear(value: str, seconds: int = CLEAR_AFTER) -> None:
+    """Copy VALUE, wait, then clear the clipboard only if it still holds VALUE."""
+    # ponytail: blocks the terminal for the wait; move to a detached clearer process if that gets annoying
+    try:
+        pyperclip.copy(value)
+    except pyperclip.PyperclipException:
+        fail("No clipboard available (on Linux, install xclip, xsel or wl-clipboard).")
+    typer.echo(f"Password copied. Clipboard clears in {seconds}s (Ctrl+C to clear now).")
+    try:
+        time.sleep(seconds)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Don't wipe something the user copied in the meantime.
+        unchanged = secrets.compare_digest(pyperclip.paste().encode(), value.encode())
+        if unchanged:
+            pyperclip.copy("")
+    typer.echo("Clipboard cleared." if unchanged else "Clipboard changed since copy; left alone.")
 
 
 def resolve(entries: list[dict], ref: str) -> dict:
@@ -72,6 +112,12 @@ def main(
     ctx.obj = vault_path
 
 
+@app.command("generate")
+def generate_cmd(length: Length = 20, symbols: Symbols = True) -> None:
+    """Print a strong random password. No vault needed; nothing is saved."""
+    typer.echo(generate(length, symbols))
+
+
 @app.command()
 def init(ctx: typer.Context) -> None:
     """Create a new, empty vault."""
@@ -91,12 +137,13 @@ def add(
     notes: Annotated[str, typer.Option()] = "",
     gen: Generate = False,
     length: Length = 20,
+    symbols: Symbols = True,
 ) -> None:
     """Add an entry. The password is prompted for, or generated with --generate."""
     path: Path = ctx.obj
     file, key, entries = unlock(path)
     entry = vault.add(entries, title=title, username=username,
-                      password=ask_entry_password(gen, length), url=url, notes=notes)
+                      password=ask_entry_password(gen, length, symbols), url=url, notes=notes)
     vault.persist(path, file, key, entries)
     typer.echo(f"Added {entry['title']} ({entry['id'][:8]})")
 
@@ -106,6 +153,7 @@ def get(
     ctx: typer.Context,
     entry_id: str,
     show: Annotated[bool, typer.Option("--show", help="Print the password instead of masking it.")] = False,
+    copy: Annotated[bool, typer.Option("--copy", "-c", help=f"Copy the password; clears after {CLEAR_AFTER}s.")] = False,
 ) -> None:
     """Show one entry. The password is masked unless --show is given."""
     _, _, entries = unlock(ctx.obj)
@@ -116,6 +164,8 @@ def get(
     typer.echo(f"password: {e['password'] if show else MASK}")
     typer.echo(f"url:      {e['url']}")
     typer.echo(f"notes:    {e['notes']}")
+    if copy:
+        copy_then_clear(e["password"])
 
 
 @app.command("list")
@@ -143,6 +193,7 @@ def edit(
     password: Annotated[bool, typer.Option("--password", help="Prompt for a new password.")] = False,
     gen: Generate = False,
     length: Length = 20,
+    symbols: Symbols = True,
 ) -> None:
     """Change fields of an entry."""
     fields = {"title": title, "username": username, "url": url, "notes": notes}
@@ -153,7 +204,7 @@ def edit(
     file, key, entries = unlock(path)
     entry = resolve(entries, entry_id)
     if password or gen:
-        changes["password"] = ask_entry_password(gen, length)
+        changes["password"] = ask_entry_password(gen, length, symbols)
     vault.edit(entries, entry["id"], **changes)
     vault.persist(path, file, key, entries)
     typer.echo(f"Updated {entry['title']}")
@@ -174,3 +225,63 @@ def delete(
     vault.delete(entries, entry["id"])
     vault.persist(path, file, key, entries)
     typer.echo(f"Deleted {entry['title']}")
+
+
+@app.command()
+def shell(
+    ctx: typer.Context,
+    idle: Annotated[int, typer.Option("--idle", min=10, help="Lock after this many seconds without input.")] = IDLE_LOCK,
+) -> None:
+    """Unlock once, then run commands interactively. Locks itself after --idle seconds without input."""
+    global _session_key
+    path: Path = ctx.obj
+    command = typer.main.get_command(app)
+
+    def lock() -> None:
+        global _session_key
+        # ponytail: drops the reference only; Python can't reliably wipe the key bytes (see README threat model)
+        _session_key = None
+        clear_screen()
+        typer.echo(f"Locked after {idle}s idle. Enter a command to unlock.")
+
+    _session_key = unlock(path)[1]
+    typer.echo("Unlocked. Type a command (e.g. list, get <id> --copy) or 'exit'.")
+    try:
+        while True:
+            timer = threading.Timer(idle, lock)  # only runs while waiting at the prompt
+            timer.daemon = True
+            timer.start()
+            try:
+                line = input("vaultlet> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            finally:
+                timer.cancel()
+            if line in ("exit", "quit"):
+                break
+            if not line:
+                continue
+            if _session_key is None:
+                try:
+                    _session_key = unlock(path)[1]
+                except typer.Exit:
+                    continue  # unlock() already printed why
+            try:
+                args = shlex.split(line)
+            except ValueError as exc:
+                typer.echo(f"Error: {exc}", err=True)
+                continue
+            if args[0] in ("shell", "init"):
+                typer.echo(f"'{args[0]}' isn't available inside the shell.", err=True)
+                continue
+            try:
+                command.main(["--vault", str(path), *args], prog_name="vaultlet", standalone_mode=False)
+            except typer.Abort:
+                typer.echo("Aborted.")
+            except typer.TyperException as exc:
+                typer.echo(f"Error: {exc}", err=True)
+    except typer.Abort:  # Ctrl+C at the unlock prompt
+        pass
+    finally:
+        _session_key = None
+    typer.echo("Locked. Bye.")
