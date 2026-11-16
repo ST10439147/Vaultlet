@@ -195,3 +195,58 @@ def test_open_vault_leaves_default_kdf_alone(tmp_path):
     path, f, _ = make_file(tmp_path)
     vault.open_vault(path, "pw")
     assert vault.load(path) == f
+
+
+def test_create_with_entries_uses_fresh_key(tmp_path):
+    path, f, vk = make_file(tmp_path)
+    out = tmp_path / "export.json"
+    vault.create(out, "exp", [{"id": "a", "title": "T"}])
+    file, key, entries = vault.open_vault(out, "exp")
+    assert entries == [{"id": "a", "title": "T"}]
+    assert key != vk and file["kdf"]["salt"] != f["kdf"]["salt"]
+
+
+def test_merge_skips_existing_and_duplicate_ids():
+    entries = []
+    vault.add(entries, title="Keep")
+    mine = dict(entries[0])
+    other = {"id": "x" * 32, "title": "New", "username": "", "password": "p", "url": "", "notes": ""}
+    assert vault.merge(entries, [mine, other, dict(other)]) == 1
+    assert [e["title"] for e in entries] == ["Keep", "New"]
+
+
+@pytest.mark.parametrize("incoming", [{"id": "a"}, [{"id": 1}], ["str"], [{"id": "a", "title": "t"}]])
+def test_merge_rejects_malformed_entries(incoming):
+    with pytest.raises(CorruptVault):
+        vault.merge([], incoming)
+
+
+CHROME_CSV = "name,url,username,password,note\nGitHub,https://github.com/,me,p1,hi\n,https://mail.example.com/login,me,p2,\n"
+FIREFOX_CSV = ('url,username,password,httpRealm,formActionOrigin,guid,timeCreated\n'
+               'https://site.example,"a,b","p""q",,,{1},0\n')
+
+
+def test_import_csv_chrome_titles_and_notes():
+    entries = []
+    assert vault.import_csv(entries, CHROME_CSV) == (2, 0)
+    gh, mail = entries
+    assert (gh["title"], gh["notes"], gh["password"]) == ("GitHub", "hi", "p1")
+    assert mail["title"] == "mail.example.com"
+
+
+def test_import_csv_firefox_quoting():
+    entries = []
+    vault.import_csv(entries, FIREFOX_CSV)
+    assert (entries[0]["title"], entries[0]["username"], entries[0]["password"]) == ("site.example", "a,b", 'p"q')
+
+
+def test_import_csv_skips_duplicates_and_blank_rows():
+    entries = []
+    vault.import_csv(entries, CHROME_CSV)
+    assert vault.import_csv(entries, CHROME_CSV + ",,,,\n") == (0, 2)
+    assert len(entries) == 2
+
+
+def test_import_csv_rejects_missing_columns():
+    with pytest.raises(ValueError, match="password"):
+        vault.import_csv([], "name,url,username\nx,y,z\n")

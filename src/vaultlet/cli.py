@@ -4,6 +4,7 @@ Secrets (master and entry passwords) are only ever read from a hidden prompt,
 never from arguments or environment variables.
 """
 
+import csv
 import os
 import secrets
 import shlex
@@ -94,6 +95,14 @@ def resolve(entries: list[dict], ref: str) -> dict:
     if len(matches) == 1:
         return matches[0]
     fail("No entry matches that id." if not matches else "That id matches several entries; type more of it.")
+
+
+def split_line(line: str) -> list[str]:
+    """Split a shell line on whitespace with quote support, but keep backslashes (Windows paths)."""
+    lexer = shlex.shlex(line, posix=True)
+    lexer.whitespace_split = True
+    lexer.escape = ""
+    return list(lexer)
 
 
 def print_rows(entries: list[dict], empty: str) -> None:
@@ -239,6 +248,55 @@ def passwd(ctx: typer.Context) -> None:
     typer.echo("Master password changed.")
 
 
+@app.command()
+def export(ctx: typer.Context, out: Path) -> None:
+    """Write all entries to OUT as a separate vault locked with its own export password."""
+    if out.exists():
+        fail(f"{out} already exists; pick a new file name.")
+    # Always ask for the master password, so walk-up access to a shell can't copy the vault out.
+    _, _, entries = unlock(ctx.obj, always_prompt=True)
+    password = typer.prompt("Export password", hide_input=True, confirmation_prompt=True)
+    vault.create(out, password, entries)
+    typer.echo(f"Exported {len(entries)} entries to {out}. It opens with the export password, "
+               f"e.g. 'vaultlet --vault {out} list'.")
+
+
+@app.command("import-vault")
+def import_vault(ctx: typer.Context, source: Path) -> None:
+    """Add entries from an exported vault file. Entries whose id already exists are skipped."""
+    if not source.exists():
+        fail(f"No file at {source}.")
+    path: Path = ctx.obj
+    file, key, entries = unlock(path)
+    try:
+        src = vault.load(source)
+        incoming = vault.read_entries(src, vault.unlock(src, typer.prompt("Export password", hide_input=True)))
+        added = vault.merge(entries, incoming)
+    except (WrongPassword, CorruptVault):
+        fail("Could not open the export: wrong password or damaged file.")
+    vault.persist(path, file, key, entries)
+    typer.echo(f"Imported {added} entries; skipped {len(incoming) - added} already present.")
+
+
+@app.command("import-csv")
+def import_csv(ctx: typer.Context, source: Path) -> None:
+    """Add entries from a Chrome, Edge or Firefox password export (CSV)."""
+    if not source.exists():
+        fail(f"No file at {source}.")
+    path: Path = ctx.obj
+    file, key, entries = unlock(path)
+    try:
+        # utf-8-sig drops the BOM some browsers write; newline="" lets csv handle quoted line breaks
+        with source.open(encoding="utf-8-sig", newline="") as handle:
+            added, skipped = vault.import_csv(entries, handle.read())
+    except (ValueError, csv.Error) as exc:  # UnicodeDecodeError is a ValueError
+        fail(f"Could not import {source}: {exc}")
+    vault.persist(path, file, key, entries)
+    typer.echo(f"Imported {added} entries; skipped {skipped} duplicates.")
+    typer.echo(f"WARNING: {source} holds every password in plain text. Delete it now, "
+               "and empty the Recycle Bin/Trash.", err=True)
+
+
 def kdf_option(name: str, flag: str, help: str):
     """An Argon2id option that can't go below the defaults (open_vault would raise it back anyway)."""
     return Annotated[int, typer.Option(flag, min=vault.crypto.KDF_DEFAULTS[name],
@@ -298,7 +356,7 @@ def shell(
                 except typer.Exit:
                     continue  # unlock() already printed why
             try:
-                args = shlex.split(line)
+                args = split_line(line)
             except ValueError as exc:
                 typer.echo(f"Error: {exc}", err=True)
                 continue

@@ -254,3 +254,66 @@ def test_upgrade_kdf_raises_params_and_vault_still_opens(tmp_path):
 def test_upgrade_kdf_refuses_weaker_than_defaults(tmp_path):
     path = init(tmp_path)
     assert run(path, "upgrade-kdf", "--memory-kib", "1024", input="pw\n").exit_code == 2
+
+
+def test_export_then_import_vault(tmp_path):
+    path, _ = add_entry(tmp_path)
+    out = tmp_path / "export.json"
+    r = run(path, "export", str(out), input="pw\nexp\nexp\n")
+    assert r.exit_code == 0, r.output
+    assert "Site" in run(out, "list", input="exp\n").output
+    assert run(path, "export", str(out), input="pw\nexp\nexp\n").exit_code == 1  # no overwrite
+
+    other = tmp_path / "other.json"
+    run(other, "init", input="o\no\n")
+    r = run(other, "import-vault", str(out), input="o\nexp\n")
+    assert "Imported 1" in r.output, r.output
+    assert "Imported 0 entries; skipped 1" in run(other, "import-vault", str(out), input="o\nexp\n").output
+    assert "Site" in run(other, "list", input="o\n").output
+
+
+def test_import_vault_wrong_export_password(tmp_path):
+    path, _ = add_entry(tmp_path)
+    out = tmp_path / "export.json"
+    run(path, "export", str(out), input="pw\nexp\nexp\n")
+    r = run(path, "import-vault", str(out), input="pw\nnope\n")
+    assert r.exit_code == 1 and "Could not open the export" in r.output
+
+
+def test_export_in_shell_asks_for_master_password(tmp_path, timer):
+    path, _ = add_entry(tmp_path)
+    out = tmp_path / "export.json"
+    r = run(path, "shell", input=f"pw\nexport {out}\nwrong\nexit\n")
+    assert "wrong password or damaged file" in r.output and not out.exists()
+
+
+def test_import_csv_with_bom_and_plaintext_warning(tmp_path):
+    path = init(tmp_path)
+    src = tmp_path / "passwords.csv"
+    src.write_bytes("﻿name,url,username,password,note\nGitHub,https://github.com,me,s3,\n".encode("utf-8"))
+    r = run(path, "import-csv", str(src), input="pw\n")
+    assert r.exit_code == 0, r.output
+    assert "Imported 1" in r.output and "plain text" in r.output
+    assert "GitHub" in run(path, "list", input="pw\n").output
+    assert src.exists()  # never deleted for the user
+
+
+def test_import_csv_rejects_non_export(tmp_path):
+    path = init(tmp_path)
+    src = tmp_path / "notes.csv"
+    src.write_text("a,b\n1,2\n", encoding="utf-8")
+    r = run(path, "import-csv", str(src), input="pw\n")
+    assert r.exit_code == 1 and "missing column" in r.output
+
+
+def test_shell_split_keeps_backslashes_and_quotes():
+    assert cli.split_line(r'export C:\Users\me\out.json') == ["export", r"C:\Users\me\out.json"]
+    assert cli.split_line(r'add "My Bank" --url "C:\a b"') == ["add", "My Bank", "--url", r"C:\a b"]
+
+
+def test_shell_export_to_unquoted_windows_style_path(tmp_path, timer):
+    path, _ = add_entry(tmp_path)
+    out = tmp_path / "sub" / "export.json"
+    out.parent.mkdir()
+    r = run(path, "shell", input=f"pw\nexport {out}\npw\nexp\nexp\nexit\n")
+    assert out.exists(), r.output

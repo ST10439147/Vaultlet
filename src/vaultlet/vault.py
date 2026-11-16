@@ -1,10 +1,13 @@
 """Vault file I/O and error mapping. Crypto lives in crypto.py."""
 
+import csv
+import io
 import json
 import os
 import shutil
 import uuid
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from cryptography.exceptions import InvalidTag
 
@@ -78,13 +81,60 @@ def read_entries(file: dict, vault_key: bytes) -> list[dict]:
         raise CorruptVault("vault contents are malformed") from exc
 
 
-def create(path: str | Path, password: str) -> None:
+def create(path: str | Path, password: str, entries: list[dict] | None = None) -> None:
+    """Write a new vault (fresh salt and vault key). Also used for encrypted exports."""
     path = Path(path)
     if path.exists():
         raise FileExistsError(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    file, _ = crypto.new_vault(password)
-    save(path, file)
+    file, vault_key = crypto.new_vault(password)
+    save(path, crypto.write_entries(file, vault_key, entries or []))
+
+
+CSV_REQUIRED = ("url", "username", "password")  # Chrome/Edge add name,note; Firefox adds httpRealm etc.
+
+
+def import_csv(entries: list[dict], text: str) -> tuple[int, int]:
+    """Add rows from a browser password export. Returns (added, skipped as duplicates).
+
+    Duplicates are rows whose (url, username, password) already exist in the vault or earlier in the file.
+    """
+    reader = csv.DictReader(io.StringIO(text))
+    missing = [c for c in CSV_REQUIRED if c not in (reader.fieldnames or [])]
+    if missing:
+        raise ValueError(f"not a browser password export: missing column(s) {', '.join(missing)}")
+    seen = {(e["url"], e["username"], e["password"]) for e in entries}
+    added = skipped = 0
+    for row in reader:
+        url, username, password = (row.get(c) or "" for c in CSV_REQUIRED)
+        if not (url or username or password):
+            continue
+        if (url, username, password) in seen:
+            skipped += 1
+            continue
+        seen.add((url, username, password))
+        title = row.get("name") or urlsplit(url).hostname or url or username
+        add(entries, title=title, username=username, password=password, url=url,
+            notes=row.get("note") or row.get("notes") or "")
+        added += 1
+    return added, skipped
+
+
+def merge(entries: list[dict], incoming: object) -> int:
+    """Add entries from another vault whose ids aren't already present. Returns how many were added."""
+    if not isinstance(incoming, list) or not all(
+        isinstance(e, dict) and all(isinstance(e.get(k), str) for k in ("id", *ENTRY_FIELDS))
+        for e in incoming
+    ):
+        raise CorruptVault("imported vault has malformed entries")
+    have = {e["id"] for e in entries}
+    added = 0
+    for e in incoming:
+        if e["id"] not in have:
+            have.add(e["id"])
+            entries.append({k: e[k] for k in ("id", *ENTRY_FIELDS)})
+            added += 1
+    return added
 
 
 def open_vault(path: str | Path, password: str,
