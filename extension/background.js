@@ -18,9 +18,12 @@ function connect() {
   });
   port.onDisconnect.addListener(() => {
     const reason = chrome.runtime.lastError?.message || "The Vaultlet helper stopped.";
-    const error = /not found|forbidden/i.test(reason)
-      ? "Vaultlet helper not installed. Run: vaultlet native install"
-      : reason;
+    // Keep the browser's own wording: "not found" and "forbidden" need different fixes.
+    const error = /not found/i.test(reason)
+      ? `${reason} Run: vaultlet native install, then reload the extension.`
+      : /forbidden/i.test(reason)
+        ? `${reason} The extension id must be ${chrome.runtime.id === "lpbnpdbfajmdfjjfmgbdngnaoghfppan" ? "allowed by the helper" : "lpbnpdbfajmdfjjfmgbdngnaoghfppan but is " + chrome.runtime.id}.`
+        : reason;
     for (const resolve of pending.values()) resolve({ ok: false, error });
     pending.clear();
     port = null;

@@ -5,6 +5,7 @@
 @media (prefers-color-scheme: dark) {
   :root { --bg: #1e1f22; --fg: #ececf0; --muted: #a0a0a8; --line: #36373c; --accent: #7aa2ff; --error: #ff7b80; }
 }
+[hidden] { display: none !important; } /* the display rules below would otherwise un-hide things */
 body { width: 340px; margin: 0; padding: 12px; font: 13px/1.4 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
 header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
 form, main { display: grid; gap: 8px; }

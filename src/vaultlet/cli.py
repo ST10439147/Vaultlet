@@ -526,3 +526,7 @@ def shell(
     finally:
         _session_key = None
     typer.echo("Locked. Bye.")
+
+
+if __name__ == "__main__":
+    app(prog_name="vaultlet")
