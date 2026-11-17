@@ -4,6 +4,7 @@ Secrets (master and entry passwords) are only ever read from a hidden prompt,
 never from arguments or environment variables.
 """
 
+import csv
 import os
 import secrets
 import shlex
@@ -15,7 +16,7 @@ from typing import Annotated, NoReturn, Optional
 import pyperclip
 import typer
 
-from vaultlet import vault
+from vaultlet import breach, sync, totp, vault
 from vaultlet.errors import CorruptVault, WrongPassword
 from vaultlet.generator import generate
 
@@ -34,6 +35,7 @@ app = typer.Typer(help="Vaultlet: a local, encrypted password manager.", no_args
 Length = Annotated[int, typer.Option("--length", min=4, help="Length for --generate.")]
 Generate = Annotated[bool, typer.Option("--generate", "-g", help="Generate a strong password.")]
 Symbols = Annotated[bool, typer.Option("--symbols/--no-symbols", help="Include symbols when generating.")]
+Totp = Annotated[bool, typer.Option("--totp", help="Prompt for a TOTP secret or otpauth:// URI (empty clears it).")]
 
 
 def fail(message: str) -> NoReturn:
@@ -51,14 +53,25 @@ def ask_entry_password(gen: bool, length: int, symbols: bool) -> str:
     return typer.prompt("Entry password", hide_input=True, confirmation_prompt=True)
 
 
-def unlock(path: Path) -> tuple[dict, bytes, list[dict]]:
+def ask_totp() -> str:
+    secret = typer.prompt("TOTP secret or otpauth:// URI", hide_input=True, default="", show_default=False)
+    if not secret.strip():
+        return ""
+    try:
+        return totp.normalize(secret)
+    except ValueError as exc:
+        fail(str(exc))
+
+
+def unlock(path: Path, always_prompt: bool = False,
+           kdf: dict | None = None) -> tuple[dict, bytes, list[dict]]:
     if not path.exists():
         fail(f"No vault at {path}. Run 'vaultlet init' first.")
     try:
-        if _session_key is not None:  # inside an unlocked shell: no prompt, re-read the file
+        if _session_key is not None and not always_prompt:  # unlocked shell: no prompt, re-read the file
             file = vault.load(path)
             return file, _session_key, vault.read_entries(file, _session_key)
-        return vault.open_vault(path, ask_master())
+        return vault.open_vault(path, ask_master(), kdf)
     except (WrongPassword, CorruptVault):
         fail(UNLOCK_FAILED)  # one message for both, so failures reveal nothing
 
@@ -67,14 +80,14 @@ def clear_screen() -> None:
     os.system("cls" if os.name == "nt" else "clear")
 
 
-def copy_then_clear(value: str, seconds: int = CLEAR_AFTER) -> None:
+def copy_then_clear(value: str, seconds: int = CLEAR_AFTER, what: str = "Password") -> None:
     """Copy VALUE, wait, then clear the clipboard only if it still holds VALUE."""
     # ponytail: blocks the terminal for the wait; move to a detached clearer process if that gets annoying
     try:
         pyperclip.copy(value)
     except pyperclip.PyperclipException:
         fail("No clipboard available (on Linux, install xclip, xsel or wl-clipboard).")
-    typer.echo(f"Password copied. Clipboard clears in {seconds}s (Ctrl+C to clear now).")
+    typer.echo(f"{what} copied. Clipboard clears in {seconds}s (Ctrl+C to clear now).")
     try:
         time.sleep(seconds)
     except KeyboardInterrupt:
@@ -93,6 +106,14 @@ def resolve(entries: list[dict], ref: str) -> dict:
     if len(matches) == 1:
         return matches[0]
     fail("No entry matches that id." if not matches else "That id matches several entries; type more of it.")
+
+
+def split_line(line: str) -> list[str]:
+    """Split a shell line on whitespace with quote support, but keep backslashes (Windows paths)."""
+    lexer = shlex.shlex(line, posix=True)
+    lexer.whitespace_split = True
+    lexer.escape = ""
+    return list(lexer)
 
 
 def print_rows(entries: list[dict], empty: str) -> None:
@@ -138,12 +159,14 @@ def add(
     gen: Generate = False,
     length: Length = 20,
     symbols: Symbols = True,
+    with_totp: Totp = False,
 ) -> None:
     """Add an entry. The password is prompted for, or generated with --generate."""
     path: Path = ctx.obj
     file, key, entries = unlock(path)
     entry = vault.add(entries, title=title, username=username,
-                      password=ask_entry_password(gen, length, symbols), url=url, notes=notes)
+                      password=ask_entry_password(gen, length, symbols), url=url, notes=notes,
+                      totp=ask_totp() if with_totp else "")
     vault.persist(path, file, key, entries)
     typer.echo(f"Added {entry['title']} ({entry['id'][:8]})")
 
@@ -164,6 +187,9 @@ def get(
     typer.echo(f"password: {e['password'] if show else MASK}")
     typer.echo(f"url:      {e['url']}")
     typer.echo(f"notes:    {e['notes']}")
+    if e["totp"]:
+        now, left = totp.code(e["totp"])
+        typer.echo(f"totp:     {now} ({left}s left)")
     if copy:
         copy_then_clear(e["password"])
 
@@ -194,17 +220,20 @@ def edit(
     gen: Generate = False,
     length: Length = 20,
     symbols: Symbols = True,
+    with_totp: Totp = False,
 ) -> None:
     """Change fields of an entry."""
     fields = {"title": title, "username": username, "url": url, "notes": notes}
     changes = {k: v for k, v in fields.items() if v is not None}
-    if not (changes or password or gen):
-        fail("Nothing to change. Pass --title, --username, --url, --notes, --password or --generate.")
+    if not (changes or password or gen or with_totp):
+        fail("Nothing to change. Pass --title, --username, --url, --notes, --password, --generate or --totp.")
     path: Path = ctx.obj
     file, key, entries = unlock(path)
     entry = resolve(entries, entry_id)
     if password or gen:
         changes["password"] = ask_entry_password(gen, length, symbols)
+    if with_totp:
+        changes["totp"] = ask_totp()
     vault.edit(entries, entry["id"], **changes)
     vault.persist(path, file, key, entries)
     typer.echo(f"Updated {entry['title']}")
@@ -225,6 +254,218 @@ def delete(
     vault.delete(entries, entry["id"])
     vault.persist(path, file, key, entries)
     typer.echo(f"Deleted {entry['title']}")
+
+
+@app.command()
+def passwd(ctx: typer.Context) -> None:
+    """Change the master password. Entries and the vault key stay the same."""
+    path: Path = ctx.obj
+    # Always ask for the current password, even in an unlocked shell, so walk-up access can't change it.
+    file, key, entries = unlock(path, always_prompt=True)
+    new = typer.prompt("New master password", hide_input=True, confirmation_prompt=True)
+    vault.rekey(path, file, key, entries, new)
+    typer.echo("Master password changed.")
+
+
+@app.command()
+def export(ctx: typer.Context, out: Path) -> None:
+    """Write all entries to OUT as a separate vault locked with its own export password."""
+    if out.exists():
+        fail(f"{out} already exists; pick a new file name.")
+    # Always ask for the master password, so walk-up access to a shell can't copy the vault out.
+    _, _, entries = unlock(ctx.obj, always_prompt=True)
+    password = typer.prompt("Export password", hide_input=True, confirmation_prompt=True)
+    vault.create(out, password, entries)
+    typer.echo(f"Exported {len(entries)} entries to {out}. It opens with the export password, "
+               f"e.g. 'vaultlet --vault {out} list'.")
+
+
+@app.command("import-vault")
+def import_vault(ctx: typer.Context, source: Path) -> None:
+    """Add entries from an exported vault file. Entries whose id already exists are skipped."""
+    if not source.exists():
+        fail(f"No file at {source}.")
+    path: Path = ctx.obj
+    file, key, entries = unlock(path)
+    try:
+        src = vault.load(source)
+        incoming = vault.read_entries(src, vault.unlock(src, typer.prompt("Export password", hide_input=True)))
+        added = vault.merge(entries, incoming)
+    except (WrongPassword, CorruptVault):
+        fail("Could not open the export: wrong password or damaged file.")
+    vault.persist(path, file, key, entries)
+    typer.echo(f"Imported {added} entries; skipped {len(incoming) - added} already present.")
+
+
+@app.command("import-csv")
+def import_csv(ctx: typer.Context, source: Path) -> None:
+    """Add entries from a Chrome, Edge or Firefox password export (CSV)."""
+    if not source.exists():
+        fail(f"No file at {source}.")
+    path: Path = ctx.obj
+    file, key, entries = unlock(path)
+    try:
+        # utf-8-sig drops the BOM some browsers write; newline="" lets csv handle quoted line breaks
+        with source.open(encoding="utf-8-sig", newline="") as handle:
+            added, skipped = vault.import_csv(entries, handle.read())
+    except (ValueError, csv.Error) as exc:  # UnicodeDecodeError is a ValueError
+        fail(f"Could not import {source}: {exc}")
+    vault.persist(path, file, key, entries)
+    typer.echo(f"Imported {added} entries; skipped {skipped} duplicates.")
+    typer.echo(f"WARNING: {source} holds every password in plain text. Delete it now, "
+               "and empty the Recycle Bin/Trash.", err=True)
+
+
+def kdf_option(name: str, flag: str, help: str):
+    """An Argon2id option that can't go below the defaults (open_vault would raise it back anyway)."""
+    return Annotated[int, typer.Option(flag, min=vault.crypto.KDF_DEFAULTS[name],
+                                       max=vault.KDF_LIMITS[name][1], help=help)]
+
+
+@app.command("upgrade-kdf")
+def upgrade_kdf(
+    ctx: typer.Context,
+    time_cost: kdf_option("time_cost", "--time-cost", "Argon2id passes.") = vault.crypto.KDF_DEFAULTS["time_cost"],
+    memory_kib: kdf_option("memory_kib", "--memory-kib", "Argon2id memory in KiB.") = vault.crypto.KDF_DEFAULTS["memory_kib"],
+    parallelism: kdf_option("parallelism", "--parallelism", "Argon2id lanes.") = vault.crypto.KDF_DEFAULTS["parallelism"],
+) -> None:
+    """Re-key the vault with stronger Argon2id settings. Aim for an unlock of about 0.5-1 s."""
+    kdf = {"time_cost": time_cost, "memory_kib": memory_kib, "parallelism": parallelism}
+    unlock(ctx.obj, always_prompt=True, kdf=kdf)  # also needed in a shell: re-keying needs the password
+    typer.echo(f"KDF set to time_cost={time_cost}, memory_kib={memory_kib}, parallelism={parallelism}.")
+
+
+@app.command("totp")
+def totp_cmd(
+    ctx: typer.Context,
+    entry_id: str,
+    copy: Annotated[bool, typer.Option("--copy", "-c", help=f"Copy the code; clears after {CLEAR_AFTER}s.")] = False,
+) -> None:
+    """Print the current TOTP code for an entry."""
+    e = resolve(unlock(ctx.obj)[2], entry_id)
+    if not e["totp"]:
+        fail(f"{e['title']} has no TOTP secret. Add one with 'vaultlet edit <id> --totp'.")
+    now, left = totp.code(e["totp"])
+    typer.echo(f"{now}  ({left}s left)")
+    if copy:
+        copy_then_clear(now, min(CLEAR_AFTER, left), what="Code")
+
+
+@app.command("breach")
+def breach_cmd(ctx: typer.Context, entry_id: Annotated[Optional[str], typer.Argument()] = None) -> None:
+    """Check passwords against Have I Been Pwned. Only a 5-character SHA-1 prefix is sent."""
+    entries = unlock(ctx.obj)[2]
+    targets = [resolve(entries, entry_id)] if entry_id else vault.list_entries(entries)
+    try:
+        counts = breach.check([e["password"] for e in targets])
+    except OSError as exc:  # URLError, timeouts and HTTP errors are all OSError
+        fail(f"Could not reach Have I Been Pwned: {exc}")
+    hits = [e for e in targets if counts.get(e["password"])]
+    for e in hits:
+        typer.echo(f"{e['id'][:8]}  {e['title']}  seen {counts[e['password']]:,} times in breaches")
+    typer.echo(f"{len(hits)} of {len(targets)} passwords found in breaches." if hits
+               else f"None of {len(targets)} passwords found in known breaches.")
+    if hits:
+        raise typer.Exit(1)
+
+
+sync_app = typer.Typer(help="Optional sync with a vaultlet-server. Only the encrypted vault leaves this machine.")
+app.add_typer(sync_app, name="sync")
+CaFile = Annotated[Optional[Path], typer.Option("--cafile", exists=True, dir_okay=False,
+                                                help="Trust this certificate (for a self-signed server).")]
+
+
+def run_sync(action):
+    """Run a sync action with one error style; never says which of password or file was wrong."""
+    try:
+        return action()
+    except (WrongPassword, CorruptVault):
+        fail(UNLOCK_FAILED)
+    except sync.SyncError as exc:
+        fail(str(exc))
+
+
+def ask_hidden(question: str) -> str:
+    return typer.prompt(question, hide_input=True)
+
+
+@sync_app.callback(invoke_without_command=True)
+def sync_main(ctx: typer.Context) -> None:
+    """Pull, merge and push. Entries edited on both sides are kept twice, marked '(conflict)'."""
+    if ctx.invoked_subcommand is not None:
+        return
+    path: Path = ctx.obj
+    if not path.exists():
+        fail(f"No vault at {path}.")
+    password = ask_master()
+    typer.echo(run_sync(lambda: sync.run(path, password, ask_hidden))[0])
+
+
+@sync_app.command("register")
+def sync_register(ctx: typer.Context, url: str, cafile: CaFile = None) -> None:
+    """Create an account on URL and upload this vault (encrypted). Prints the account id."""
+    path: Path = ctx.obj
+    if not path.exists():
+        fail(f"No vault at {path}. Run 'vaultlet init' first.")
+    password = ask_master()
+    token = typer.prompt("Server registration token", hide_input=True)
+    account = run_sync(lambda: sync.register(path, password, url, token, str(cafile.resolve()) if cafile else None))
+    typer.echo(f"Registered. Account id: {account}")
+    typer.echo(f"On another device: vaultlet sync link {url} {account}")
+
+
+@sync_app.command("link")
+def sync_link(ctx: typer.Context, url: str, account: str, cafile: CaFile = None) -> None:
+    """Connect this device to an account. Downloads it, or merges it with the vault already here."""
+    path: Path = ctx.obj
+    password = typer.prompt("Master password of the synced vault", hide_input=True)
+    message = run_sync(lambda: sync.link(path, password, url, account, ask_hidden,
+                                         str(cafile.resolve()) if cafile else None))
+    typer.echo(f"Linked {path}. {message}")
+
+
+native_app = typer.Typer(help="Browser extension helper (Chrome, Edge, Brave, Chromium).", no_args_is_help=True)
+app.add_typer(native_app, name="native")
+
+
+@native_app.command("install")
+def native_install(
+    ctx: typer.Context,
+    idle: Annotated[int, typer.Option("--idle", min=10, help="Helper locks after this many seconds unused.")] = IDLE_LOCK,
+) -> None:
+    """Register the helper so the extension can reach this vault. Per-user; no admin rights needed."""
+    from vaultlet import native
+
+    path: Path = ctx.obj
+    if not path.exists():  # fine: the helper says "No vault at ..." until 'vaultlet init' creates it
+        typer.echo(f"Note: no vault at {path} yet. Create it with 'vaultlet init'.")
+    places = native.install(path, idle, Path.home())
+    typer.echo(f"Helper registered for {path} (extension id {native.EXTENSION_ID}).")
+    for place in places:
+        typer.echo(f"  {place}")
+    if not places:
+        typer.echo("No supported browser profile folder found; the manifest is in ~/.vaultlet/native.")
+    typer.echo("Load the extension/ folder as an unpacked extension, then restart the browser.")
+
+
+@native_app.command("uninstall")
+def native_uninstall() -> None:
+    """Remove the helper registration."""
+    from vaultlet import native
+
+    native.uninstall(Path.home())
+    typer.echo("Helper unregistered.")
+
+
+@app.command()
+def tui(
+    ctx: typer.Context,
+    idle: Annotated[int, typer.Option("--idle", min=10, help="Lock after this many seconds without input.")] = IDLE_LOCK,
+) -> None:
+    """Full-screen terminal UI: browse, search, add, edit, delete and copy entries."""
+    from vaultlet.tui import run  # lazy: keeps Textual's import cost off every other command
+
+    run(ctx.obj, idle)
 
 
 @app.command()
@@ -267,7 +508,7 @@ def shell(
                 except typer.Exit:
                     continue  # unlock() already printed why
             try:
-                args = shlex.split(line)
+                args = split_line(line)
             except ValueError as exc:
                 typer.echo(f"Error: {exc}", err=True)
                 continue
@@ -285,3 +526,7 @@ def shell(
     finally:
         _session_key = None
     typer.echo("Locked. Bye.")
+
+
+if __name__ == "__main__":
+    app(prog_name="vaultlet")

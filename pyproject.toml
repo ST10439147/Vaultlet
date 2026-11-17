@@ -11,14 +11,18 @@ dependencies = [
     "argon2-cffi",
     "cryptography",
     "pyperclip",
+    "pyotp",
+    "textual",
     "typer",
 ]
 
 [project.scripts]
 vaultlet = "vaultlet.cli:app"
+vaultlet-server = "vaultlet.server:main"
 
 [project.optional-dependencies]
-dev = ["pytest"]
+server = ["fastapi", "uvicorn"]
+dev = ["pytest", "httpx", "vaultlet[server]"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

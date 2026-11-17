@@ -7,6 +7,8 @@ import unicodedata
 
 from argon2.low_level import Type, hash_secret_raw
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 KDF_DEFAULTS = {"time_cost": 3, "memory_kib": 65536, "parallelism": 4}
 
@@ -48,15 +50,24 @@ def _unseal(key: bytes, box: dict, aad: bytes) -> bytes:
 
 
 def new_vault(password: str) -> tuple[dict, bytes]:
-    salt = os.urandom(16)
     vault_key = os.urandom(32)
-    file = {
-        "version": 1,
-        "kdf": {"alg": "argon2id", "salt": b64e(salt), **KDF_DEFAULTS},
-    }
-    kek = derive_kek(password, salt, file["kdf"])
-    file["wrapped_key"] = _seal(kek, vault_key, _aad(file, b"key"))
-    return write_entries(file, vault_key, []), vault_key
+    return rekey({"version": 1}, vault_key, [], password, KDF_DEFAULTS), vault_key
+
+
+def rekey(file: dict, vault_key: bytes, entries: list[dict], password: str,
+          kdf: dict | None = None) -> dict:
+    """Wrap the same vault key under a new password and/or KDF params, with a fresh salt.
+
+    The header is in both AADs, so the entries are re-sealed too. kdf=None keeps the
+    file's current params.
+    """
+    if kdf is None:
+        kdf = {k: v for k, v in file["kdf"].items() if k not in ("alg", "salt")}
+    salt = os.urandom(16)
+    new = {"version": file["version"], "kdf": {"alg": "argon2id", "salt": b64e(salt), **kdf}}
+    kek = derive_kek(password, salt, new["kdf"])
+    new["wrapped_key"] = _seal(kek, vault_key, _aad(new, b"key"))
+    return write_entries(new, vault_key, entries)
 
 
 def unlock(file: dict, password: str) -> bytes:
@@ -72,3 +83,13 @@ def read_entries(file: dict, vault_key: bytes) -> list[dict]:
 def write_entries(file: dict, vault_key: bytes, entries: list[dict]) -> dict:
     plaintext = json.dumps(entries).encode()
     return {**file, "vault": _seal(vault_key, plaintext, _aad(file, b"vault"))}
+
+
+def subkey(key: bytes, info: bytes) -> bytes:
+    """Derive an independent 32-byte key for one purpose (HKDF-SHA256; INFO separates purposes)."""
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=info).derive(key)
+
+
+def sync_auth_key(password: str, kdf: dict) -> bytes:
+    """Sync login key: HKDF of the KEK. The server only learns this, and it can't be turned back into the KEK."""
+    return subkey(derive_kek(password, b64d(kdf["salt"]), kdf), b"vaultlet sync auth v1")
