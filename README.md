@@ -16,6 +16,7 @@ Password management system: a local-first, zero-knowledge password manager in Py
 | Browser CSV left on disk | No | It is plaintext; `import-csv` warns, but deleting it is up to you |
 | Hostile vault/export file with huge KDF settings | Yes | KDF parameters are bounded at load |
 | Weak master password | No | Strength check only; cannot be fixed in code |
+| Breach check leaking passwords | Yes | HIBP k-anonymity: only a 5-char SHA-1 prefix is sent, with padded responses |
 | Malware or keylogger on your machine | No | Out of scope |
 | Memory scraping while unlocked | Limited | Python cannot reliably wipe memory |
 
@@ -46,9 +47,16 @@ vaultlet import-vault backup.json   # merge an export back in (skips ids already
 vaultlet import-csv passwords.csv   # Chrome / Edge / Firefox export; delete the CSV afterwards
 vaultlet shell --idle 300           # unlock once; locks and clears the screen after 300 s idle
 vaultlet tui --idle 300             # full-screen UI; creates the vault if missing; locks when idle
+vaultlet add GitHub --totp          # also prompts for a TOTP secret or otpauth:// URI (edit --totp; empty clears)
+vaultlet totp <id> --copy           # current 2FA code; clipboard clears when the code expires
+vaultlet breach                     # check every password with Have I Been Pwned (or: breach <id>)
 ```
 
-In the TUI: `/` search, `a` add, `e` edit, `d` delete, `c` copy password (clears after 20 s), `u` copy username, `s` show/hide password, `Ctrl+L` lock, `Ctrl+Q` quit. Ctrl+G in the entry form generates a password. Use the CLI for `passwd`, `export`, the imports and `upgrade-kdf`.
+In the TUI: `/` search, `a` add, `e` edit, `d` delete, `c` copy password (clears after 20 s), `u` copy username, `t` copy TOTP code, `b` breach check, `s` show/hide password, `Ctrl+L` lock, `Ctrl+Q` quit. Ctrl+G in the entry form generates a password. The detail panel shows the live TOTP code.
+
+**Breach check privacy:** it uses the HIBP [range API](https://haveibeenpwned.com/API/v3#PwnedPasswords). Only the first 5 hex characters of each password's SHA-1 are sent; the full hash and the password never leave your machine, and responses are padded so their size doesn't reveal anything. HIBP still sees your IP address and when you checked. `breach` exits with status 1 if any password is found.
+
+**TOTP:** keeping the second factor in the same vault as the password means one unlocked vault gives both. That's convenient, but weaker than a separate authenticator app; choose per account. Use the CLI for `passwd`, `export`, the imports and `upgrade-kdf`.
 
 The clipboard is only cleared if it still holds the copied password. On Linux, `--copy` needs `xclip`, `xsel` or `wl-clipboard`.
 

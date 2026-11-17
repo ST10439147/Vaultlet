@@ -14,7 +14,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, DataTable, Footer, Input, Label, Static
 
-from vaultlet import vault
+from vaultlet import breach, totp, vault
 from vaultlet.errors import CorruptVault, WrongPassword
 from vaultlet.generator import generate
 
@@ -78,7 +78,8 @@ class UnlockScreen(Screen):
 
 
 class EntryForm(ModalScreen[dict | None]):
-    FIELDS = ("title", "username", "password", "url", "notes")
+    FIELDS = ("title", "username", "password", "url", "notes", "totp")
+    PLACEHOLDERS = {"totp": "TOTP secret or otpauth:// URI (optional)"}
     BINDINGS = [Binding("escape", "dismiss(None)", "Cancel"), Binding("ctrl+g", "generate", "Generate")]
 
     def __init__(self, entry: dict | None = None) -> None:
@@ -89,8 +90,8 @@ class EntryForm(ModalScreen[dict | None]):
         with Vertical(id="form"):
             yield Label("Edit entry" if self.entry else "New entry")
             for name in self.FIELDS:
-                yield Input(self.entry.get(name, ""), placeholder=name.capitalize(),
-                            password=name == "password", id=name)
+                yield Input(self.entry.get(name, ""), placeholder=self.PLACEHOLDERS.get(name, name.capitalize()),
+                            password=name in ("password", "totp"), id=name)
             with Horizontal():
                 yield Button("Save", variant="primary", id="save")
                 yield Button("Generate (ctrl+g)", id="gen")
@@ -122,6 +123,14 @@ class EntryForm(ModalScreen[dict | None]):
         if not values["title"].strip():
             self.query_one("#error", Label).update("Title is required.")
             return
+        if values["totp"].strip():
+            try:
+                values["totp"] = totp.normalize(values["totp"])
+            except ValueError as exc:
+                self.query_one("#error", Label).update(str(exc))
+                return
+        else:
+            values["totp"] = ""
         self.dismiss(values)
 
 
@@ -150,6 +159,8 @@ class MainScreen(Screen):
         Binding("d", "delete", "Delete"),
         Binding("c", "copy('password')", "Copy password"),
         Binding("u", "copy('username')", "Copy user"),
+        Binding("t", "copy_totp", "Copy TOTP"),
+        Binding("b", "breach_check", "Breach check"),
         Binding("s", "toggle_show", "Show/hide"),
         Binding("slash", "focus_search", "Search"),
         Binding("ctrl+l", "app.lock", "Lock"),
@@ -168,6 +179,11 @@ class MainScreen(Screen):
         self.query_one(DataTable).add_columns("Title", "Username", "URL")
         self.refresh_table()
         self.query_one(DataTable).focus()
+        self.set_interval(1, self.tick)
+
+    def tick(self) -> None:
+        if (e := self.selected()) and e["totp"]:  # keep the code and countdown live
+            self.show_detail()
 
     def refresh_table(self, select: str | None = None) -> None:
         query = self.query_one("#search", Input).value
@@ -197,7 +213,14 @@ class MainScreen(Screen):
         pw = e["password"] if self.show else MASK
         detail.update("\n".join(f"[b]{k:<9}[/b] {escape(v)}" for k, v in [
             ("title", e["title"]), ("username", e["username"]), ("password", pw),
-            ("url", e["url"]), ("notes", e["notes"]), ("id", e["id"][:8])]))
+            ("url", e["url"]), ("notes", e["notes"]), ("totp", self.totp_text(e)), ("id", e["id"][:8])]))
+
+    @staticmethod
+    def totp_text(e: dict) -> str:
+        if not e["totp"]:
+            return ""
+        now, left = totp.code(e["totp"])
+        return f"{now[:3]} {now[3:]}  ({left}s)"
 
     def on_input_changed(self, event: Input.Changed) -> None:
         self.refresh_table()
@@ -219,6 +242,30 @@ class MainScreen(Screen):
     def action_copy(self, field: str) -> None:
         if e := self.selected():
             self.app.copy(e[field], secret=field == "password")
+
+    def action_copy_totp(self) -> None:
+        if (e := self.selected()) and e["totp"]:
+            now, left = totp.code(e["totp"])
+            self.app.copy(now, secret=True, what="Code", seconds=min(CLEAR_AFTER, left))
+
+    def action_breach_check(self) -> None:
+        self.notify("Checking passwords with Have I Been Pwned (only 5-character hash prefixes are sent)...")
+        self.check_breaches([(e["title"], e["password"]) for e in self.app.entries])
+
+    @work(thread=True, exclusive=True, group="breach")
+    def check_breaches(self, pairs: list[tuple[str, str]]) -> None:
+        try:
+            counts = breach.check([pw for _, pw in pairs])
+        except OSError as exc:
+            self.app.call_from_thread(self.notify, f"Could not reach Have I Been Pwned: {exc}", severity="error")
+            return
+        hits = sorted({title for title, pw in pairs if counts.get(pw)})
+        if self.app.key is None:  # locked while checking: don't put titles on the lock screen
+            return
+        message = (f"{len(hits)} of {len(pairs)} passwords found in breaches: {', '.join(hits)}" if hits
+                   else f"None of {len(pairs)} passwords found in known breaches.")
+        self.app.call_from_thread(self.notify, message, severity="warning" if hits else "information",
+                                  timeout=15 if hits else 5)
 
     def action_add(self) -> None:
         def done(values: dict | None) -> None:
@@ -294,7 +341,7 @@ class VaultletApp(App):
             self.pop_screen()
         self.switch_screen(UnlockScreen())
 
-    def copy(self, value: str, secret: bool) -> None:
+    def copy(self, value: str, secret: bool, what: str = "Password", seconds: int = CLEAR_AFTER) -> None:
         try:
             pyperclip.copy(value)
         except pyperclip.PyperclipException:
@@ -304,8 +351,8 @@ class VaultletApp(App):
             self.notify("Copied.")
             return
         self.copied = value
-        self.notify(f"Password copied. Clipboard clears in {CLEAR_AFTER}s.")
-        self.set_timer(CLEAR_AFTER, self.clear_clipboard)
+        self.notify(f"{what} copied. Clipboard clears in {seconds}s.")
+        self.set_timer(seconds, self.clear_clipboard)
 
     def clear_clipboard(self) -> None:
         """Clear the clipboard only if it still holds the password we copied."""
