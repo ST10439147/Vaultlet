@@ -1,0 +1,326 @@
+"""Textual terminal UI. Like cli.py, it talks to vault.py and never touches crypto directly."""
+
+import secrets
+import time
+from pathlib import Path
+
+import pyperclip
+from rich.markup import escape
+from rich.text import Text
+from textual import events, work
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical
+from textual.screen import ModalScreen, Screen
+from textual.widgets import Button, DataTable, Footer, Input, Label, Static
+
+from vaultlet import vault
+from vaultlet.errors import CorruptVault, WrongPassword
+from vaultlet.generator import generate
+
+UNLOCK_FAILED = "Could not unlock the vault: wrong password or damaged file."
+MASK = "********"
+CLEAR_AFTER = 20
+IDLE_LOCK = 300
+
+CSS = """
+UnlockScreen { align: center middle; }
+#unlock { width: 60; height: auto; border: round $accent; padding: 1 2; }
+#unlock Input { margin-top: 1; }
+#error { color: $error; margin-top: 1; }
+#detail { height: auto; border: round $accent; padding: 0 1; }
+EntryForm, ConfirmDelete { align: center middle; }
+#form, #confirm { width: 70; height: auto; border: round $accent; padding: 1 2; background: $surface; }
+#form Horizontal, #confirm Horizontal { height: auto; margin-top: 1; }
+#form Button, #confirm Button { margin-right: 1; }
+"""
+
+
+class UnlockScreen(Screen):
+    """Asks for the master password; creates the vault if there isn't one yet."""
+
+    def compose(self) -> ComposeResult:
+        creating = not self.app.path.exists()
+        with Vertical(id="unlock"):
+            yield Label(f"{'Create' if creating else 'Unlock'} vault at {self.app.path}")
+            yield Input(placeholder="Master password", password=True, id="pw")
+            if creating:
+                yield Input(placeholder="Repeat master password", password=True, id="pw2")
+            yield Label("", id="error")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        pw = self.query_one("#pw", Input).value
+        if not pw:
+            return
+        if self.app.path.exists():
+            self.query_one("#error", Label).update("Unlocking...")
+            self.unlock(pw)
+        elif event.input.id == "pw":
+            self.query_one("#pw2", Input).focus()
+        elif pw != event.value:
+            self.query_one("#error", Label).update("Passwords don't match.")
+        else:
+            vault.create(self.app.path, pw)
+            self.unlock(pw)
+
+    @work(thread=True, exclusive=True)  # Argon2id takes ~0.5 s; keep the UI responsive
+    def unlock(self, pw: str) -> None:
+        try:
+            opened = vault.open_vault(self.app.path, pw)
+        except (WrongPassword, CorruptVault):
+            self.app.call_from_thread(self.failed)
+        else:
+            self.app.call_from_thread(self.app.unlocked, *opened)
+
+    def failed(self) -> None:
+        self.query_one("#error", Label).update(UNLOCK_FAILED)
+        self.query_one("#pw", Input).value = ""
+
+
+class EntryForm(ModalScreen[dict | None]):
+    FIELDS = ("title", "username", "password", "url", "notes")
+    BINDINGS = [Binding("escape", "dismiss(None)", "Cancel"), Binding("ctrl+g", "generate", "Generate")]
+
+    def __init__(self, entry: dict | None = None) -> None:
+        super().__init__()
+        self.entry = entry or {}
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="form"):
+            yield Label("Edit entry" if self.entry else "New entry")
+            for name in self.FIELDS:
+                yield Input(self.entry.get(name, ""), placeholder=name.capitalize(),
+                            password=name == "password", id=name)
+            with Horizontal():
+                yield Button("Save", variant="primary", id="save")
+                yield Button("Generate (ctrl+g)", id="gen")
+                yield Button("Show", id="show")
+                yield Button("Cancel", id="cancel")
+            yield Label("", id="error")
+
+    def action_generate(self) -> None:
+        self.query_one("#password", Input).value = generate()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        match event.button.id:
+            case "gen":
+                self.action_generate()
+            case "show":
+                pw = self.query_one("#password", Input)
+                pw.password = not pw.password
+                event.button.label = "Hide" if not pw.password else "Show"
+            case "cancel":
+                self.dismiss(None)
+            case "save":
+                self.save()
+
+    def on_input_submitted(self) -> None:
+        self.save()
+
+    def save(self) -> None:
+        values = {name: self.query_one(f"#{name}", Input).value for name in self.FIELDS}
+        if not values["title"].strip():
+            self.query_one("#error", Label).update("Title is required.")
+            return
+        self.dismiss(values)
+
+
+class ConfirmDelete(ModalScreen[bool]):
+    BINDINGS = [Binding("escape", "dismiss(False)", "Cancel"), Binding("y", "dismiss(True)", "Yes")]
+
+    def __init__(self, title: str) -> None:
+        super().__init__()
+        self.entry_title = title
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm"):
+            yield Label(f"Delete {self.entry_title}?")
+            with Horizontal():
+                yield Button("Delete (y)", variant="error", id="yes")
+                yield Button("Cancel", id="no")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "yes")
+
+
+class MainScreen(Screen):
+    BINDINGS = [
+        Binding("a", "add", "Add"),
+        Binding("e", "edit", "Edit"),
+        Binding("d", "delete", "Delete"),
+        Binding("c", "copy('password')", "Copy password"),
+        Binding("u", "copy('username')", "Copy user"),
+        Binding("s", "toggle_show", "Show/hide"),
+        Binding("slash", "focus_search", "Search"),
+        Binding("ctrl+l", "app.lock", "Lock"),
+        Binding("ctrl+q", "app.quit", "Quit"),
+    ]
+
+    show = False
+
+    def compose(self) -> ComposeResult:
+        yield Input(placeholder="Search title or username  (/)", id="search")
+        yield DataTable(cursor_type="row", zebra_stripes=True)
+        yield Static(id="detail")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one(DataTable).add_columns("Title", "Username", "URL")
+        self.refresh_table()
+        self.query_one(DataTable).focus()
+
+    def refresh_table(self, select: str | None = None) -> None:
+        query = self.query_one("#search", Input).value
+        entries = self.app.entries
+        rows = vault.list_entries(vault.search(entries, query) if query else entries)
+        table = self.query_one(DataTable)
+        table.clear()
+        for e in rows:
+            table.add_row(*(Text(e[k]) for k in ("title", "username", "url")), key=e["id"])  # Text: no markup parsing
+        if select and select in [e["id"] for e in rows]:
+            table.move_cursor(row=table.get_row_index(select))
+        self.show_detail()
+
+    def selected(self) -> dict | None:
+        table = self.query_one(DataTable)
+        if not table.row_count:
+            return None
+        key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+        return vault.get(self.app.entries, key)
+
+    def show_detail(self) -> None:
+        e = self.selected()
+        detail = self.query_one("#detail", Static)
+        if e is None:
+            detail.update("Vault is empty. Press 'a' to add an entry." if not self.app.entries else "No matches.")
+            return
+        pw = e["password"] if self.show else MASK
+        detail.update("\n".join(f"[b]{k:<9}[/b] {escape(v)}" for k, v in [
+            ("title", e["title"]), ("username", e["username"]), ("password", pw),
+            ("url", e["url"]), ("notes", e["notes"]), ("id", e["id"][:8])]))
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        self.refresh_table()
+
+    def on_input_submitted(self) -> None:
+        self.query_one(DataTable).focus()
+
+    def on_data_table_row_highlighted(self) -> None:
+        self.show = False  # never carry a revealed password over to the next row
+        self.show_detail()
+
+    def action_focus_search(self) -> None:
+        self.query_one("#search", Input).focus()
+
+    def action_toggle_show(self) -> None:
+        self.show = not self.show
+        self.show_detail()
+
+    def action_copy(self, field: str) -> None:
+        if e := self.selected():
+            self.app.copy(e[field], secret=field == "password")
+
+    def action_add(self) -> None:
+        def done(values: dict | None) -> None:
+            if values:
+                entry = vault.add(self.app.entries, **values)
+                self.app.save()
+                self.refresh_table(select=entry["id"])
+        self.app.push_screen(EntryForm(), done)
+
+    def action_edit(self) -> None:
+        if (e := self.selected()) is None:
+            return
+
+        def done(values: dict | None) -> None:
+            if values:
+                vault.edit(self.app.entries, e["id"], **values)
+                self.app.save()
+                self.refresh_table(select=e["id"])
+        self.app.push_screen(EntryForm(e), done)
+
+    def action_delete(self) -> None:
+        if (e := self.selected()) is None:
+            return
+
+        def done(yes: bool | None) -> None:
+            if yes:
+                vault.delete(self.app.entries, e["id"])
+                self.app.save()
+                self.refresh_table()
+        self.app.push_screen(ConfirmDelete(e["title"]), done)
+
+
+class VaultletApp(App):
+    TITLE = "Vaultlet"
+    CSS = CSS
+    BINDINGS = [Binding("ctrl+q", "quit", "Quit")]
+
+    def __init__(self, path: Path, idle: int = IDLE_LOCK) -> None:
+        super().__init__()
+        self.path, self.idle = path, idle
+        self.file: dict | None = None
+        self.key: bytes | None = None
+        self.entries: list[dict] = []
+        self.last_input = time.monotonic()
+        self.copied: str | None = None
+
+    def on_mount(self) -> None:
+        self.push_screen(UnlockScreen())
+        self.set_interval(1, self.lock_if_idle)
+
+    async def on_event(self, event: events.Event) -> None:
+        if isinstance(event, (events.Key, events.MouseDown, events.MouseScrollDown, events.MouseScrollUp)):
+            self.last_input = time.monotonic()
+        await super().on_event(event)
+
+    def lock_if_idle(self) -> None:
+        if self.key is not None and time.monotonic() - self.last_input > self.idle:
+            self.action_lock()
+
+    def unlocked(self, file: dict, key: bytes, entries: list[dict]) -> None:
+        self.file, self.key, self.entries = file, key, entries
+        self.last_input = time.monotonic()
+        self.switch_screen(MainScreen())
+
+    def save(self) -> None:
+        self.file = vault.persist(self.path, self.file, self.key, self.entries)
+
+    def action_lock(self) -> None:
+        # ponytail: drops references only; Python can't reliably wipe the key bytes (see README threat model)
+        self.file = self.key = None
+        self.entries = []
+        while len(self.screen_stack) > 2:  # close any open form so its fields don't linger
+            self.pop_screen()
+        self.switch_screen(UnlockScreen())
+
+    def copy(self, value: str, secret: bool) -> None:
+        try:
+            pyperclip.copy(value)
+        except pyperclip.PyperclipException:
+            self.notify("No clipboard available (on Linux, install xclip, xsel or wl-clipboard).", severity="error")
+            return
+        if not secret:
+            self.notify("Copied.")
+            return
+        self.copied = value
+        self.notify(f"Password copied. Clipboard clears in {CLEAR_AFTER}s.")
+        self.set_timer(CLEAR_AFTER, self.clear_clipboard)
+
+    def clear_clipboard(self) -> None:
+        """Clear the clipboard only if it still holds the password we copied."""
+        if self.copied is None:
+            return
+        try:
+            if secrets.compare_digest(pyperclip.paste().encode(), self.copied.encode()):
+                pyperclip.copy("")
+        except pyperclip.PyperclipException:
+            pass
+        self.copied = None
+
+    def on_unmount(self) -> None:
+        self.clear_clipboard()  # don't leave a password behind on quit
+
+
+def run(path: Path, idle: int = IDLE_LOCK) -> None:
+    VaultletApp(path, idle).run()

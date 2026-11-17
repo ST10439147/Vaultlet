@@ -317,6 +317,17 @@ def upgrade_kdf(
 
 
 @app.command()
+def tui(
+    ctx: typer.Context,
+    idle: Annotated[int, typer.Option("--idle", min=10, help="Lock after this many seconds without input.")] = IDLE_LOCK,
+) -> None:
+    """Full-screen terminal UI: browse, search, add, edit, delete and copy entries."""
+    from vaultlet.tui import run  # lazy: keeps Textual's import cost off every other command
+
+    run(ctx.obj, idle)
+
+
+@app.command()
 def shell(
     ctx: typer.Context,
     idle: Annotated[int, typer.Option("--idle", min=10, help="Lock after this many seconds without input.")] = IDLE_LOCK,

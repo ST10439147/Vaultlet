@@ -45,7 +45,10 @@ vaultlet export backup.json         # separate vault file with its own export pa
 vaultlet import-vault backup.json   # merge an export back in (skips ids already present)
 vaultlet import-csv passwords.csv   # Chrome / Edge / Firefox export; delete the CSV afterwards
 vaultlet shell --idle 300           # unlock once; locks and clears the screen after 300 s idle
+vaultlet tui --idle 300             # full-screen UI; creates the vault if missing; locks when idle
 ```
+
+In the TUI: `/` search, `a` add, `e` edit, `d` delete, `c` copy password (clears after 20 s), `u` copy username, `s` show/hide password, `Ctrl+L` lock, `Ctrl+Q` quit. Ctrl+G in the entry form generates a password. Use the CLI for `passwd`, `export`, the imports and `upgrade-kdf`.
 
 The clipboard is only cleared if it still holds the copied password. On Linux, `--copy` needs `xclip`, `xsel` or `wl-clipboard`.
 
