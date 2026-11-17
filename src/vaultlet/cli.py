@@ -16,7 +16,7 @@ from typing import Annotated, NoReturn, Optional
 import pyperclip
 import typer
 
-from vaultlet import breach, totp, vault
+from vaultlet import breach, sync, totp, vault
 from vaultlet.errors import CorruptVault, WrongPassword
 from vaultlet.generator import generate
 
@@ -367,6 +367,56 @@ def breach_cmd(ctx: typer.Context, entry_id: Annotated[Optional[str], typer.Argu
                else f"None of {len(targets)} passwords found in known breaches.")
     if hits:
         raise typer.Exit(1)
+
+
+sync_app = typer.Typer(help="Optional sync with a vaultlet-server. Only the encrypted vault leaves this machine.")
+app.add_typer(sync_app, name="sync")
+CaFile = Annotated[Optional[Path], typer.Option("--cafile", exists=True, dir_okay=False,
+                                                help="Trust this certificate (for a self-signed server).")]
+
+
+def run_sync(action):
+    """Run a sync action with one error style; never says which of password or file was wrong."""
+    try:
+        return action()
+    except (WrongPassword, CorruptVault):
+        fail(UNLOCK_FAILED)
+    except sync.SyncError as exc:
+        fail(str(exc))
+
+
+@sync_app.callback(invoke_without_command=True)
+def sync_main(ctx: typer.Context) -> None:
+    """Pull, merge and push. Entries edited on both sides are kept twice, marked '(conflict)'."""
+    if ctx.invoked_subcommand is not None:
+        return
+    path: Path = ctx.obj
+    if not path.exists():
+        fail(f"No vault at {path}.")
+    password = ask_master()
+    typer.echo(run_sync(lambda: sync.run(path, password, lambda q: typer.prompt(q, hide_input=True))))
+
+
+@sync_app.command("register")
+def sync_register(ctx: typer.Context, url: str, cafile: CaFile = None) -> None:
+    """Create an account on URL and upload this vault (encrypted). Prints the account id."""
+    path: Path = ctx.obj
+    if not path.exists():
+        fail(f"No vault at {path}. Run 'vaultlet init' first.")
+    password = ask_master()
+    token = typer.prompt("Server registration token", hide_input=True)
+    account = run_sync(lambda: sync.register(path, password, url, token, str(cafile.resolve()) if cafile else None))
+    typer.echo(f"Registered. Account id: {account}")
+    typer.echo(f"On another device: vaultlet sync link {url} {account}")
+
+
+@sync_app.command("link")
+def sync_link(ctx: typer.Context, url: str, account: str, cafile: CaFile = None) -> None:
+    """Download an existing account into a new vault file on this device."""
+    path: Path = ctx.obj
+    password = ask_master()
+    count = run_sync(lambda: sync.link(path, password, url, account, str(cafile.resolve()) if cafile else None))
+    typer.echo(f"Linked. Downloaded {count} entries to {path}.")
 
 
 @app.command()

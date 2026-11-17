@@ -38,10 +38,17 @@ def load(path: str | Path) -> dict:
         data = json.loads(text)
     except ValueError as exc:  # covers empty, truncated and non-JSON input
         raise CorruptVault("vault file is not valid JSON") from exc
+    check_file(data)
+    return data
+
+
+def check_file(data: object) -> None:
+    """Structural check of a parsed vault file; also used on blobs from the sync server and its clients."""
     if not isinstance(data, dict) or any(k not in data for k in REQUIRED_FIELDS):
         raise CorruptVault("vault file is missing required fields")
     check_kdf(data["kdf"])
-    return data
+    if not isinstance(data["kdf"].get("salt"), str):
+        raise CorruptVault("vault KDF salt is missing")
 
 
 def save(path: str | Path, file: dict) -> None:
