@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Vaultlet",
+  "version": "0.1.0",
+  "description": "Fill and copy logins from your local Vaultlet vault.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArIuBV+l4dJn+4zNnzPKUpYnFFRgbX90/WuVuSEWTz6fjdnsQsNzWGRoyz6+6KnExrUDrUFzX+dVb6lRQdo+XetzNb9Mmq+6CgI1PWzrvcr/eSaufK2QtJm5kF9KzFY0k6Y7zCe+CDxPK0fThmNKjQHGus9yCUS65eQ4DbHixSIVpTHRvcA6GoKCOrTRg2LeFw3Py1VeyjeweuCmUGrqIelRsuGk1nf5VpWayhB+rZfpbOCjwZVLeFyL0swmfKtpwllPbiqVuooQ/Sm7RN53RWuYw97Q5EhYnc2i1dAE+TOOywIuL0HLJHhor2p4VgPH0AKfH1gM+bxV5XKF/O7e9pQIDAQAB",
+  "minimum_chrome_version": "116",
+  "permissions": ["nativeMessaging", "activeTab", "scripting"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "popup.html", "default_title": "Vaultlet" },
+  "commands": {
+    "_execute_action": { "suggested_key": { "default": "Ctrl+Shift+L", "mac": "Command+Shift+L" } }
+  }
+}

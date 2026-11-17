@@ -424,6 +424,39 @@ def sync_link(ctx: typer.Context, url: str, account: str, cafile: CaFile = None)
     typer.echo(f"Linked {path}. {message}")
 
 
+native_app = typer.Typer(help="Browser extension helper (Chrome, Edge, Brave, Chromium).", no_args_is_help=True)
+app.add_typer(native_app, name="native")
+
+
+@native_app.command("install")
+def native_install(
+    ctx: typer.Context,
+    idle: Annotated[int, typer.Option("--idle", min=10, help="Helper locks after this many seconds unused.")] = IDLE_LOCK,
+) -> None:
+    """Register the helper so the extension can reach this vault. Per-user; no admin rights needed."""
+    from vaultlet import native
+
+    path: Path = ctx.obj
+    if not path.exists():  # fine: the helper says "No vault at ..." until 'vaultlet init' creates it
+        typer.echo(f"Note: no vault at {path} yet. Create it with 'vaultlet init'.")
+    places = native.install(path, idle, Path.home())
+    typer.echo(f"Helper registered for {path} (extension id {native.EXTENSION_ID}).")
+    for place in places:
+        typer.echo(f"  {place}")
+    if not places:
+        typer.echo("No supported browser profile folder found; the manifest is in ~/.vaultlet/native.")
+    typer.echo("Load the extension/ folder as an unpacked extension, then restart the browser.")
+
+
+@native_app.command("uninstall")
+def native_uninstall() -> None:
+    """Remove the helper registration."""
+    from vaultlet import native
+
+    native.uninstall(Path.home())
+    typer.echo("Helper unregistered.")
+
+
 @app.command()
 def tui(
     ctx: typer.Context,

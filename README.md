@@ -22,6 +22,11 @@ Password management system: a local-first, zero-knowledge password manager in Py
 | Hostile vault/export file with huge KDF settings | Yes | KDF parameters are bounded at load |
 | Weak master password | No | Strength check only; cannot be fixed in code |
 | Breach check leaking passwords | Yes | HIBP k-anonymity: only a 5-char SHA-1 prefix is sent, with padded responses |
+| Web page reaching the vault through the extension | Yes | No content scripts, no `externally_connectable`, no host permissions; the page only gets code injected when you click Fill |
+| Other extensions or programs talking to the helper | Partly | Native messaging: no network port, and the browser only starts the helper for Vaultlet's extension id. Local malware could still run the helper itself, but it could also read the vault file |
+| Phishing look-alike sites | Yes | Fill is only offered and only answered for entries whose saved host matches the page (same host or a subdomain), on https; the page host is checked again at fill time |
+| Credentials leaking into iframes | Yes | Fill runs in the top frame only |
+| Unlocked helper left running | Partly | Locks after `--idle` seconds unused (default 300) and when the browser closes |
 | Malware or keylogger on your machine | No | Out of scope |
 | Memory scraping while unlocked | Limited | Python cannot reliably wipe memory |
 
@@ -89,6 +94,20 @@ vaultlet sync                                                        # pull, mer
 - `link` downloads the account if this device has no vault. If it has one, its entries are merged in (asking for its password if it differs) and the device switches to the synced master password. Delete `<vault>.sync` to stop syncing.
 - In the TUI, `y` syncs. It asks for the master password each time, because the TUI keeps the vault key, never the password, and edits wait until the sync finishes. Set up with `register` / `link` in the CLI first.
 - Registration-token guesses are rate-limited the same way as logins.
+
+## Browser extension
+
+A Chromium extension (Chrome, Edge, Brave, Chromium) in `extension/`, talking to a local helper over [native messaging](https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging). The browser starts the helper (`python -m vaultlet.native`) itself and talks to it over stdin/stdout, so there is no network port.
+
+```
+vaultlet native install --idle 300    # per-user: writes ~/.vaultlet/native and registers it (HKCU on Windows)
+```
+
+Then open `chrome://extensions`, enable Developer mode, **Load unpacked**, pick the `extension/` folder, and restart the browser. The extension id is pinned to `lpbnpdbfajmdfjjfmgbdngnaoghfppan` by the public key in its manifest, and the helper only accepts that id. `vaultlet native uninstall` removes the registration.
+
+Click the icon (or Ctrl+Shift+L): unlock with the master password, then **Fill** a login for the current site, or copy the password, username or TOTP code. Copies happen in the helper and clear after 20 s. Search finds any entry for copying; fill is only offered for entries saved for the current site, on https pages. The helper reads the vault fresh for each request, so edits from the CLI, TUI or a sync show up straight away.
+
+Not supported yet: Firefox (different background model and manifest keys), saving new logins from a page, filling inside iframes. A Chrome Web Store build would get a different id; update `EXTENSION_ID` in `native.py` to match.
 
 ## Development
 
