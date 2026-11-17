@@ -17,6 +17,8 @@ import json
 import os
 import sqlite3
 import sys
+import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -29,6 +31,40 @@ MAX_BODY = 16 * 1024 * 1024  # far above any real vault; stops memory-exhaustion
 
 SCHEMA = """CREATE TABLE IF NOT EXISTS accounts (
     id TEXT PRIMARY KEY, auth_hash BLOB NOT NULL, version INTEGER NOT NULL, blob TEXT NOT NULL)"""
+
+
+class Throttle:
+    """Per-key exponential backoff after repeated failures (auth per account, and registration).
+
+    The first FREE failures cost nothing (typos). After that each failure doubles the wait, up to
+    MAX_WAIT, and every attempt during the wait is refused, right or wrong. That caps online
+    guessing at roughly one try per MAX_WAIT per account, while a locked-out owner waits at most
+    MAX_WAIT. A success clears the count.
+    """
+
+    FREE, MAX_WAIT = 5, 900
+
+    def __init__(self, clock=time.monotonic) -> None:
+        # ponytail: in memory, so a restart forgives everyone; persist it if the server restarts often
+        self.clock, self.lock, self.state = clock, threading.Lock(), {}
+
+    def check(self, key: str) -> None:
+        with self.lock:
+            _, until = self.state.get(key, (0, 0.0))
+            wait = until - self.clock()
+        if wait > 0:
+            raise HTTPException(429, "too many failed attempts; try again later",
+                                headers={"Retry-After": str(int(wait) + 1)})
+
+    def failed(self, key: str) -> None:
+        with self.lock:
+            count = self.state.get(key, (0, 0.0))[0] + 1
+            until = self.clock() + min(2 ** (count - self.FREE), self.MAX_WAIT) if count >= self.FREE else 0.0
+            self.state[key] = (count, until)
+
+    def succeeded(self, key: str) -> None:
+        with self.lock:
+            self.state.pop(key, None)
 
 
 def _hash(auth_key: bytes) -> bytes:
@@ -69,9 +105,10 @@ async def _json_body(request: Request) -> dict:
     return data
 
 
-def create_app(db_path: str | Path, register_token: str | None) -> FastAPI:
+def create_app(db_path: str | Path, register_token: str | None, throttle: Throttle | None = None) -> FastAPI:
     # No interactive docs: nothing here is meant for browsing.
     app = FastAPI(title="Vaultlet sync", docs_url=None, redoc_url=None, openapi_url=None)
+    throttle = throttle or Throttle()
     with sqlite3.connect(db_path) as conn:
         conn.execute(SCHEMA)
 
@@ -88,21 +125,27 @@ def create_app(db_path: str | Path, register_token: str | None) -> FastAPI:
 
     def authorize(conn: sqlite3.Connection, account: str, authorization: str | None) -> tuple[int, str]:
         auth_hash, version, blob = row(conn, account)
+        throttle.check(account)  # before comparing, so a locked account can't be probed at all
         scheme, _, token = (authorization or "").partition(" ")
         try:
             key = base64.b64decode(token, validate=True)
         except binascii.Error:
             key = b""
         if scheme.lower() != "bearer" or not hmac.compare_digest(_hash(key), auth_hash):
+            throttle.failed(account)
             raise HTTPException(401, "bad auth key", headers={"WWW-Authenticate": "Bearer"})
+        throttle.succeeded(account)
         return version, blob
 
     @app.post("/v1/accounts", status_code=201)
     async def register(request: Request, x_register_token: str | None = Header(None)) -> dict:
         if not register_token:
             raise HTTPException(403, "registration is disabled on this server")
+        throttle.check("register")
         if not hmac.compare_digest((x_register_token or "").encode(), register_token.encode()):
+            throttle.failed("register")
             raise HTTPException(403, "wrong registration token")
+        throttle.succeeded("register")
         data = await _json_body(request)
         auth_key, blob = _decode_key(data.get("auth_key")), _check_blob(data.get("blob"))
         account = uuid.uuid4().hex

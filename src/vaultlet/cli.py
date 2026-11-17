@@ -385,6 +385,10 @@ def run_sync(action):
         fail(str(exc))
 
 
+def ask_hidden(question: str) -> str:
+    return typer.prompt(question, hide_input=True)
+
+
 @sync_app.callback(invoke_without_command=True)
 def sync_main(ctx: typer.Context) -> None:
     """Pull, merge and push. Entries edited on both sides are kept twice, marked '(conflict)'."""
@@ -394,7 +398,7 @@ def sync_main(ctx: typer.Context) -> None:
     if not path.exists():
         fail(f"No vault at {path}.")
     password = ask_master()
-    typer.echo(run_sync(lambda: sync.run(path, password, lambda q: typer.prompt(q, hide_input=True))))
+    typer.echo(run_sync(lambda: sync.run(path, password, ask_hidden))[0])
 
 
 @sync_app.command("register")
@@ -412,11 +416,12 @@ def sync_register(ctx: typer.Context, url: str, cafile: CaFile = None) -> None:
 
 @sync_app.command("link")
 def sync_link(ctx: typer.Context, url: str, account: str, cafile: CaFile = None) -> None:
-    """Download an existing account into a new vault file on this device."""
+    """Connect this device to an account. Downloads it, or merges it with the vault already here."""
     path: Path = ctx.obj
-    password = ask_master()
-    count = run_sync(lambda: sync.link(path, password, url, account, str(cafile.resolve()) if cafile else None))
-    typer.echo(f"Linked. Downloaded {count} entries to {path}.")
+    password = typer.prompt("Master password of the synced vault", hide_input=True)
+    message = run_sync(lambda: sync.link(path, password, url, account, ask_hidden,
+                                         str(cafile.resolve()) if cafile else None))
+    typer.echo(f"Linked {path}. {message}")
 
 
 @app.command()

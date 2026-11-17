@@ -2,6 +2,7 @@
 
 import secrets
 import time
+from concurrent.futures import Future
 from pathlib import Path
 
 import pyperclip
@@ -14,7 +15,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, DataTable, Footer, Input, Label, Static
 
-from vaultlet import breach, totp, vault
+from vaultlet import breach, sync, totp, vault
 from vaultlet.errors import CorruptVault, WrongPassword
 from vaultlet.generator import generate
 
@@ -29,8 +30,8 @@ UnlockScreen { align: center middle; }
 #unlock Input { margin-top: 1; }
 #error { color: $error; margin-top: 1; }
 #detail { height: auto; border: round $accent; padding: 0 1; }
-EntryForm, ConfirmDelete { align: center middle; }
-#form, #confirm { width: 70; height: auto; border: round $accent; padding: 1 2; background: $surface; }
+EntryForm, ConfirmDelete, PasswordPrompt { align: center middle; }
+#form, #confirm, #prompt { width: 70; height: auto; border: round $accent; padding: 1 2; background: $surface; }
 #form Horizontal, #confirm Horizontal { height: auto; margin-top: 1; }
 #form Button, #confirm Button { margin-right: 1; }
 """
@@ -134,6 +135,30 @@ class EntryForm(ModalScreen[dict | None]):
         self.dismiss(values)
 
 
+class PasswordPrompt(ModalScreen[str | None]):
+    """Hidden password prompt. With a Future, a worker thread can wait on it; closing it any way
+    (including an idle lock popping it) answers None, so the waiting thread never hangs."""
+
+    BINDINGS = [Binding("escape", "dismiss(None)", "Cancel")]
+
+    def __init__(self, question: str, answer: Future | None = None) -> None:
+        super().__init__()
+        self.question, self.answer, self.value = question, answer, None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="prompt"):
+            yield Label(self.question)
+            yield Input(password=True)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.value = event.value or None
+        self.dismiss(self.value)
+
+    def on_unmount(self) -> None:
+        if self.answer is not None and not self.answer.done():
+            self.answer.set_result(self.value)
+
+
 class ConfirmDelete(ModalScreen[bool]):
     BINDINGS = [Binding("escape", "dismiss(False)", "Cancel"), Binding("y", "dismiss(True)", "Yes")]
 
@@ -161,6 +186,7 @@ class MainScreen(Screen):
         Binding("u", "copy('username')", "Copy user"),
         Binding("t", "copy_totp", "Copy TOTP"),
         Binding("b", "breach_check", "Breach check"),
+        Binding("y", "sync", "Sync"),
         Binding("s", "toggle_show", "Show/hide"),
         Binding("slash", "focus_search", "Search"),
         Binding("ctrl+l", "app.lock", "Lock"),
@@ -267,7 +293,24 @@ class MainScreen(Screen):
         self.app.call_from_thread(self.notify, message, severity="warning" if hits else "information",
                                   timeout=15 if hits else 5)
 
+    def busy(self) -> bool:
+        if self.app.syncing:  # an edit now would be overwritten by the sync result
+            self.notify("Wait for the sync to finish.", severity="warning")
+        return self.app.syncing
+
+    def action_sync(self) -> None:
+        if not sync.config_path(self.app.path).exists():
+            self.notify("This vault isn't set up for sync. Run 'vaultlet sync register' or "
+                        "'vaultlet sync link' first.", severity="warning", timeout=8)
+        elif not self.busy():
+            # Asked each time: the TUI keeps the vault key, never the master password.
+            self.app.push_screen(PasswordPrompt("Master password (to sign in to the sync server)"),
+                                 lambda pw: pw and self.app.start_sync(pw))
+
     def action_add(self) -> None:
+        if self.busy():
+            return
+
         def done(values: dict | None) -> None:
             if values:
                 entry = vault.add(self.app.entries, **values)
@@ -276,7 +319,7 @@ class MainScreen(Screen):
         self.app.push_screen(EntryForm(), done)
 
     def action_edit(self) -> None:
-        if (e := self.selected()) is None:
+        if self.busy() or (e := self.selected()) is None:
             return
 
         def done(values: dict | None) -> None:
@@ -287,7 +330,7 @@ class MainScreen(Screen):
         self.app.push_screen(EntryForm(e), done)
 
     def action_delete(self) -> None:
-        if (e := self.selected()) is None:
+        if self.busy() or (e := self.selected()) is None:
             return
 
         def done(yes: bool | None) -> None:
@@ -311,6 +354,8 @@ class VaultletApp(App):
         self.entries: list[dict] = []
         self.last_input = time.monotonic()
         self.copied: str | None = None
+        self.syncing = False
+        self.session = 0  # bumped on lock, so a sync that finishes after a lock is ignored
 
     def on_mount(self) -> None:
         self.push_screen(UnlockScreen())
@@ -337,9 +382,45 @@ class VaultletApp(App):
         # ponytail: drops references only; Python can't reliably wipe the key bytes (see README threat model)
         self.file = self.key = None
         self.entries = []
+        self.session += 1
         while len(self.screen_stack) > 2:  # close any open form so its fields don't linger
             self.pop_screen()
         self.switch_screen(UnlockScreen())
+
+    def start_sync(self, password: str) -> None:
+        self.syncing = True
+        self.notify("Syncing...")
+        self.run_sync(password, self.session)
+
+    @work(thread=True, group="sync")
+    def run_sync(self, password: str, session: int) -> None:
+        def ask(question: str) -> str:  # called by sync.run when the server copy has another password
+            answer: Future = Future()
+            self.call_from_thread(self.push_screen, PasswordPrompt(question, answer))
+            if not (value := answer.result()):
+                raise sync.SyncError("Sync cancelled.")
+            return value
+
+        try:
+            result = sync.run(self.path, password, ask)
+        except (WrongPassword, CorruptVault):
+            result = UNLOCK_FAILED
+        except sync.SyncError as exc:
+            result = str(exc)
+        self.call_from_thread(self.sync_finished, session, result)
+
+    def sync_finished(self, session: int, result: str | tuple) -> None:
+        self.syncing = False
+        if session != self.session or self.key is None:
+            return  # locked meanwhile; the merged vault is on disk for the next unlock
+        if isinstance(result, str):
+            self.notify(result, severity="error", timeout=10)
+            return
+        message, self.file, self.key, self.entries = result
+        for screen in self.screen_stack:
+            if isinstance(screen, MainScreen):
+                screen.refresh_table()
+        self.notify(message, timeout=10)
 
     def copy(self, value: str, secret: bool, what: str = "Password", seconds: int = CLEAR_AFTER) -> None:
         try:

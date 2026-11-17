@@ -59,6 +59,10 @@ def server(tmp_path):
     thread.join(5)
 
 
+def srun(*args):
+    return sync.run(*args)[0]
+
+
 def titles(path, pw="pw"):
     return sorted(e["title"] for e in vault.open_vault(path, pw)[2])
 
@@ -97,16 +101,16 @@ def test_two_devices(server, tmp_path):
     account = sync.register(a, "pw", server["url"], TOKEN, server["cafile"])
 
     with pytest.raises(WrongPassword):
-        sync.link(b, "nope", server["url"], account, server["cafile"])
-    assert sync.link(b, "pw", server["url"], account, server["cafile"]) == 1
-    assert sync.run(b, "pw", never) == "Already up to date."
+        sync.link(b, "nope", server["url"], account, never, server["cafile"])
+    assert sync.link(b, "pw", server["url"], account, never, server["cafile"]) == "Downloaded 1 entries."
+    assert srun(b, "pw", never) == "Already up to date."
 
     # Independent changes on each side merge.
     change(a, lambda es: vault.add(es, title="Mail"))
     change(b, lambda es: vault.add(es, title="Bank"))
-    assert "Pushed" in sync.run(a, "pw", never)
-    assert "Pulled" in sync.run(b, "pw", never) and titles(b) == ["Bank", "GitHub", "Mail"]
-    sync.run(a, "pw", never)
+    assert "Pushed" in srun(a, "pw", never)
+    assert "Pulled" in srun(b, "pw", never) and titles(b) == ["Bank", "GitHub", "Mail"]
+    srun(a, "pw", never)
     assert titles(a) == titles(b)
 
     # Same entry edited on both sides: both versions survive.
@@ -114,23 +118,23 @@ def test_two_devices(server, tmp_path):
         return lambda es: vault.edit(es, next(e for e in es if e["title"] == "GitHub")["id"], title=new)
     change(a, retitle("GitHub-A"))
     change(b, retitle("GitHub-B"))
-    sync.run(a, "pw", never)
-    assert "edited on both sides" in sync.run(b, "pw", never)
-    sync.run(a, "pw", never)
+    srun(a, "pw", never)
+    assert "edited on both sides" in srun(b, "pw", never)
+    srun(a, "pw", never)
     assert titles(a) == titles(b) == ["Bank", "GitHub-A (conflict)", "GitHub-B", "Mail"]
 
     # Deletes propagate.
     change(a, lambda es: vault.delete(es, next(e for e in es if e["title"] == "Bank")["id"]))
-    sync.run(a, "pw", never)
-    sync.run(b, "pw", never)
+    srun(a, "pw", never)
+    srun(b, "pw", never)
     assert "Bank" not in titles(b)
 
     # Master password change on A: B is asked for it once, then adopts it.
     file, key, entries = vault.open_vault(a, "pw")
     vault.rekey(a, file, key, entries, "new-pw")
-    assert sync.run(a, "new-pw", lambda q: "pw") == "Pushed changes."
+    assert srun(a, "new-pw", lambda q: "pw") == "Pushed changes."
     asked = []
-    msg = sync.run(b, "pw", lambda q: asked.append(q) or "new-pw")
+    msg = srun(b, "pw", lambda q: asked.append(q) or "new-pw")
     assert asked and "now uses the synced master password" in msg
     assert titles(b, "new-pw") == titles(a, "new-pw")
     with pytest.raises(WrongPassword):
@@ -178,14 +182,14 @@ def test_hostile_kdf_from_server_is_refused(monkeypatch, tmp_path):
     monkeypatch.setattr(sync, "_request", lambda *a, **k: {"kdf": {"salt": "AA==", "time_cost": 10**6,
                                                                      "memory_kib": 65536, "parallelism": 4}})
     with pytest.raises(Exception, match="out of range"):
-        sync.run(a, "pw", never)
+        srun(a, "pw", never)
 
 
 def test_push_race_retries_and_merges(server, tmp_path, monkeypatch):
     a, b = tmp_path / "a" / "vault.json", tmp_path / "b" / "vault.json"
     vault.create(a, "pw")
     account = sync.register(a, "pw", server["url"], TOKEN, server["cafile"])
-    sync.link(b, "pw", server["url"], account, server["cafile"])
+    sync.link(b, "pw", server["url"], account, never, server["cafile"])
     change(a, lambda es: vault.add(es, title="FromA"))
     change(b, lambda es: vault.add(es, title="FromB"))
 
@@ -194,13 +198,13 @@ def test_push_race_retries_and_merges(server, tmp_path, monkeypatch):
     def racing(cfg, method, *args, **kwargs):
         if method == "PUT" and not raced:  # B sneaks a push in between A's pull and A's push
             raced.append(True)
-            sync.run(b, "pw", never)
+            srun(b, "pw", never)
         return real(cfg, method, *args, **kwargs)
 
     monkeypatch.setattr(sync, "_request", racing)
-    sync.run(a, "pw", never)  # first PUT gets 409, then A re-pulls, merges and pushes
+    srun(a, "pw", never)  # first PUT gets 409, then A re-pulls, merges and pushes
     monkeypatch.setattr(sync, "_request", real)
-    sync.run(b, "pw", never)
+    srun(b, "pw", never)
     assert raced and titles(a) == titles(b) == ["FromA", "FromB"]
 
 
@@ -216,9 +220,113 @@ def test_cli_sync_commands(server, tmp_path):
     assert r.exit_code == 0, r.output
     account = r.output.split("Account id: ")[1].split()[0]
     r = run(b, "sync", "link", server["url"], account, "--cafile", server["cafile"], input="pw\n")
-    assert r.exit_code == 0 and "Downloaded 0 entries" in r.output, r.output
+    assert r.exit_code == 0 and "Downloaded 0 entries." in r.output, r.output
     assert "Already up to date." in run(b, "sync", input="pw\n").output
     r = run(b, "sync", input="wrong\n")
     assert r.exit_code == 1 and "Could not unlock" in r.output
     r = run(tmp_path / "c.json", "sync", "link", "http://example.com", "x", input="pw\n")
     assert r.exit_code == 1 and "https://" in r.output
+
+
+def test_failed_logins_back_off(tmp_path):
+    from fastapi.testclient import TestClient
+    from vaultlet.server import Throttle
+
+    now = [0.0]
+    client = TestClient(create_app(tmp_path / "s.db", TOKEN, Throttle(clock=lambda: now[0])))
+    a = tmp_path / "vault.json"
+    vault.create(a, "pw")
+    file = vault.load(a)
+    good = base64.b64encode(crypto.sync_auth_key("pw", file["kdf"])).decode()
+    account = client.post("/v1/accounts", headers={"X-Register-Token": TOKEN},
+                          json={"auth_key": good, "blob": file}).json()["account"]
+    get = lambda key: client.get(f"/v1/accounts/{account}/vault", headers={"Authorization": f"Bearer {key}"})
+    bad = base64.b64encode(bytes(32)).decode()
+
+    assert [get(bad).status_code for _ in range(5)] == [401] * 5  # typos are free
+    r = get(good)
+    assert r.status_code == 429 and r.headers["Retry-After"] == "2"  # locked: even the right key waits
+    now[0] += 1.5
+    assert get(good).status_code == 200  # wait over; success clears the count
+    assert [get(bad).status_code for _ in range(5)] == [401] * 5
+    for _ in range(30):  # keep failing: the wait doubles but stays capped
+        now[0] += 10**4
+        get(bad)
+    assert int(get(good).headers["Retry-After"]) == Throttle.MAX_WAIT + 1
+
+    for _ in range(5):
+        client.post("/v1/accounts", headers={"X-Register-Token": "guess"}, json={})
+    assert client.post("/v1/accounts", headers={"X-Register-Token": TOKEN}, json={}).status_code == 429
+
+
+def test_link_merges_into_existing_vault(server, tmp_path):
+    a, b = tmp_path / "a" / "vault.json", tmp_path / "b" / "vault.json"
+    vault.create(a, "pw")
+    change(a, lambda es: vault.add(es, title="Shared"))
+    account = sync.register(a, "pw", server["url"], TOKEN, server["cafile"])
+    vault.create(b, "local-pw")
+    change(b, lambda es: vault.add(es, title="OnlyHere"), pw="local-pw")
+
+    asked = []
+    msg = sync.link(b, "pw", server["url"], account, lambda q: asked.append(q) or "local-pw", server["cafile"])
+    assert asked and "Pushed" in msg and "now uses the synced master password" in msg
+    assert titles(b) == ["OnlyHere", "Shared"]
+    with pytest.raises(WrongPassword):
+        vault.open_vault(b.with_name("vault.json.bak"), "local-pw")
+    srun(a, "pw", never)
+    assert titles(a) == ["OnlyHere", "Shared"]
+    with pytest.raises(sync.SyncError, match="already set up"):
+        sync.link(b, "pw", server["url"], account, never, server["cafile"])
+
+
+def test_tui_sync(server, tmp_path):
+    import asyncio
+    from textual.widgets import DataTable, Input
+    from vaultlet.tui import MainScreen, PasswordPrompt, VaultletApp
+
+    a, b = tmp_path / "a" / "vault.json", tmp_path / "b" / "vault.json"
+    vault.create(a, "pw")
+    account = sync.register(a, "pw", server["url"], TOKEN, server["cafile"])
+    sync.link(b, "pw", server["url"], account, never, server["cafile"])
+    change(a, lambda es: vault.add(es, title="FromA"))
+    srun(a, "pw", never)
+
+    answered = []
+
+    async def answer(app, pilot, text):
+        for _ in range(500):  # the worker opens the prompt from its thread; wait for a new one
+            if isinstance(app.screen, PasswordPrompt) and app.screen not in answered and app.screen.query(Input):
+                break
+            await pilot.pause(0.02)
+        answered.append(app.screen)
+        app.screen.query_one(Input).value = text
+        await pilot.press("enter")
+
+    async def flow():
+        app = VaultletApp(b)
+        async with app.run_test() as pilot:
+            app.screen.query_one("#pw", Input).value = "pw"
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert isinstance(app.screen, MainScreen)
+
+            await pilot.press("y")
+            await answer(app, pilot, "pw")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert app.screen.query_one(DataTable).row_count == 1 and not app.syncing
+
+            file, key, entries = vault.open_vault(a, "pw")  # A changes the master password
+            vault.rekey(a, file, key, entries, "new-pw")
+            srun(a, "new-pw", lambda q: "pw")
+
+            await pilot.press("y")
+            await answer(app, pilot, "pw")
+            await answer(app, pilot, "new-pw")  # asked for the synced copy's password
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            assert any("now uses the synced master password" in str(n.message) for n in app._notifications)
+
+    asyncio.run(flow())
+    assert titles(b, "new-pw") == ["FromA"]

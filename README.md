@@ -10,7 +10,7 @@ Password management system: a local-first, zero-knowledge password manager in Py
 | Compromised or curious sync server | Yes | Stores the encrypted vault file and SHA-256 of an HKDF-derived auth key; never sees the password, KEK or vault key |
 | Sync server reading the auth key in transit or memory | Partly | It's HKDF(KEK), so it can't be reversed to the KEK; it does let that server guess master passwords offline (Argon2id cost per guess), same as holding the vault file |
 | Network attacker between client and server | Yes | TLS required (https only, except loopback); self-signed servers are pinned with `--cafile` |
-| Online password guessing against the sync server | Partly | Each guess costs a client-side Argon2id run; the server has no rate limiting, so a weak master password is still weak |
+| Online password guessing against the sync server | Yes | Each guess costs a client-side Argon2id run, and after 5 failures per account the server backs off exponentially to one try per 15 min. Someone who knows your account id can use this to delay your syncs by up to 15 min; the backoff is in memory and resets on restart |
 | Two devices editing at once | Yes | Server accepts a push only against the latest version (409 otherwise); the client merges three-way and keeps both copies of an entry edited on both sides |
 | Sync metadata on disk | Partly | `<vault>.sync` holds the URL, account id, entry ids and keyed (HMAC) fingerprints: reveals the entry count, not contents |
 | Shoulder-surfing, walk-up access | Partly | Passwords masked unless `--show`; `shell` clears the screen and locks when idle; copied passwords cleared after 20 s |
@@ -57,7 +57,7 @@ vaultlet totp <id> --copy           # current 2FA code; clipboard clears when th
 vaultlet breach                     # check every password with Have I Been Pwned (or: breach <id>)
 ```
 
-In the TUI: `/` search, `a` add, `e` edit, `d` delete, `c` copy password (clears after 20 s), `u` copy username, `t` copy TOTP code, `b` breach check, `s` show/hide password, `Ctrl+L` lock, `Ctrl+Q` quit. Ctrl+G in the entry form generates a password. The detail panel shows the live TOTP code.
+In the TUI: `/` search, `a` add, `e` edit, `d` delete, `c` copy password (clears after 20 s), `u` copy username, `t` copy TOTP code, `b` breach check, `y` sync, `s` show/hide password, `Ctrl+L` lock, `Ctrl+Q` quit. Ctrl+G in the entry form generates a password. The detail panel shows the live TOTP code.
 
 **Breach check privacy:** it uses the HIBP [range API](https://haveibeenpwned.com/API/v3#PwnedPasswords). Only the first 5 hex characters of each password's SHA-1 are sent; the full hash and the password never leave your machine, and responses are padded so their size doesn't reveal anything. HIBP still sees your IP address and when you checked. `breach` exits with status 1 if any password is found.
 
@@ -80,14 +80,15 @@ Registration only works while `VAULTLET_REGISTER_TOKEN` is set; restart the serv
 
 ```
 vaultlet sync register https://myhost:8443 --cafile cert.pem         # upload this vault; prints the account id
-vaultlet --vault new.json sync link https://myhost:8443 <account> --cafile cert.pem   # on another device
+vaultlet sync link https://myhost:8443 <account> --cafile cert.pem  # on another device
 vaultlet sync                                                        # pull, merge, push
 ```
 
 - **Conflicts:** pushes carry the version they were based on. If another device pushed first, the server answers 409 and the client pulls, merges and retries. The merge compares each entry with the last sync. One-sided edits, additions and deletions win. An entry edited on both sides is kept twice, the other copy marked `(conflict)`. An edit beats a delete.
 - **Changing the master password:** run `passwd` on one device, then `sync`; it asks once for the old password to authenticate and uploads the new key. Other devices are asked for the new password on their next `sync` and switch to it.
-- `link` only downloads into a new vault file. To fold in an existing vault, `export` it and `import-vault` it after linking. Delete `<vault>.sync` to stop syncing.
-- Sync is CLI-only; the TUI doesn't sync.
+- `link` downloads the account if this device has no vault. If it has one, its entries are merged in (asking for its password if it differs) and the device switches to the synced master password. Delete `<vault>.sync` to stop syncing.
+- In the TUI, `y` syncs. It asks for the master password each time, because the TUI keeps the vault key, never the password, and edits wait until the sync finishes. Set up with `register` / `link` in the CLI first.
+- Registration-token guesses are rate-limited the same way as logins.
 
 ## Development
 

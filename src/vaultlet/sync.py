@@ -83,6 +83,8 @@ def _request(cfg: dict, method: str, route: str, body: dict | None = None,
         except ValueError:
             detail = None
         message = detail.get("error") if isinstance(detail, dict) else detail
+        if exc.code == 429:
+            message = f"{message}. Retry in {exc.headers.get('Retry-After', '?')} s"
         raise SyncError(f"Server said {exc.code}: {message or exc.reason}", exc.code) from None
     except (urllib.error.URLError, OSError) as exc:  # includes TLS verification failures
         raise SyncError(f"Could not reach the sync server: {getattr(exc, 'reason', exc)}") from None
@@ -146,11 +148,16 @@ def register(path: Path, password: str, url: str, token: str, cafile: str | None
     return reply["account"]
 
 
-def link(path: Path, password: str, url: str, account: str, cafile: str | None = None) -> int:
-    """Download an existing account into a new vault file on this device. Returns the entry count."""
-    if path.exists():
-        raise SyncError(f"{path} already exists. 'link' downloads into a new vault file; pick another --vault "
-                        "and move entries across with export / import-vault.")
+def link(path: Path, password: str, url: str, account: str, ask_password: Callable[[str], str],
+         cafile: str | None = None) -> str:
+    """Connect this device to an existing account.
+
+    With no vault here, the server copy is downloaded. With one, its entries are merged into the
+    server copy (same id edited differently = kept twice) and this device switches to the synced
+    master password. PASSWORD is the synced vault's; ASK_PASSWORD gets the local one if it differs.
+    """
+    if config_path(path).exists():
+        raise SyncError("This vault is already set up for sync.")
     cfg = {"url": check_url(url), "cafile": cafile, "account": account}
     try:
         version, blob = _pull(cfg, crypto.sync_auth_key(password, _server_kdf(cfg)))
@@ -159,15 +166,33 @@ def link(path: Path, password: str, url: str, account: str, cafile: str | None =
             raise WrongPassword("wrong master password for that account") from None
         raise
     key = vault.unlock(blob, password)
-    entries = vault.read_entries(blob, key)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    vault.save(path, blob)
-    save_config(path, {**cfg, "version": version, "salt": blob["kdf"]["salt"], "base": fingerprints(key, entries)})
-    return len(entries)
+    remote = vault.read_entries(blob, key)
+    existing = path.exists()
+    if existing:
+        try:
+            _, _, local = vault.open_vault(path, password)
+        except WrongPassword:
+            _, _, local = vault.open_vault(path, ask_password("Master password of the vault already on this device"))
+        merged, _ = merge3({}, local, remote, key)  # no common history: union, conflicts kept twice
+        vault.save(path, crypto.write_entries(blob, key, merged))
+        shutil.copyfile(path, path.with_name(path.name + ".bak"))  # the old local password must not open it
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        vault.save(path, blob)
+    # Base = the server copy, so the next run pushes exactly what this device added.
+    save_config(path, {**cfg, "version": version, "salt": blob["kdf"]["salt"], "base": fingerprints(key, remote)})
+    if not existing:
+        return f"Downloaded {len(remote)} entries."
+    message = run(path, password, ask_password)[0]
+    return f"Merged {len(local)} local entries with {len(remote)} synced ones. {message} "            "This device now uses the synced master password."
 
 
-def run(path: Path, password: str, ask_password: Callable[[str], str], attempts: int = 5) -> str:
-    """Pull, merge, push. Retries when another device pushed in between (409)."""
+def run(path: Path, password: str, ask_password: Callable[[str], str],
+        attempts: int = 5) -> tuple[str, dict, bytes, list[dict]]:
+    """Pull, merge, push. Retries when another device pushed in between (409).
+
+    Returns (summary, vault file, vault key, entries) as now saved on this device.
+    """
     cfg = load_config(path)
     file, key, local = vault.open_vault(path, password)
     server_password = password
@@ -217,5 +242,5 @@ def run(path: Path, password: str, ask_password: Callable[[str], str], attempts:
         if conflicts:
             parts.append(f"{conflicts} entr{'y was' if conflicts == 1 else 'ies were'} edited on both sides; "
                          "the other version was kept with '(conflict)' in its title.")
-        return " ".join(p for p in parts if p) or "Already up to date."
+        return " ".join(p for p in parts if p) or "Already up to date.", new_file, new_key, merged
     raise SyncError("The server copy kept changing during sync; try again.")
