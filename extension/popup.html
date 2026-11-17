@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Vaultlet</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <strong>Vaultlet</strong>
+    <button id="lock" hidden>Lock</button>
+  </header>
+
+  <form id="unlock" hidden>
+    <label for="password">Master password</label>
+    <input id="password" type="password" autocomplete="off" required autofocus>
+    <button type="submit">Unlock</button>
+  </form>
+
+  <main id="vault" hidden>
+    <p id="site" class="muted"></p>
+    <ul id="matches"></ul>
+    <label for="search" class="muted">Search all entries (copy only)</label>
+    <input id="search" type="search" autocomplete="off">
+    <ul id="results"></ul>
+  </main>
+
+  <p id="message" role="status"></p>
+  <script src="popup.js"></script>
+</body>
+</html>

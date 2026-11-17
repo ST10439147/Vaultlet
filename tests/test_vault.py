@@ -62,7 +62,7 @@ def test_unlock_and_read_entries_happy_path(tmp_path):
     _, f, _ = make_file(tmp_path, password="pw")
     f = crypto.write_entries(f, crypto.unlock(f, "pw"), [{"title": "GitHub"}])
     vk = vault.unlock(f, "pw")
-    assert vault.read_entries(f, vk) == [{"title": "GitHub"}]
+    assert vault.read_entries(f, vk) == [{"title": "GitHub", "totp": ""}]  # totp backfilled
 
 
 def test_failed_save_keeps_old_file(tmp_path, monkeypatch):
@@ -202,7 +202,7 @@ def test_create_with_entries_uses_fresh_key(tmp_path):
     out = tmp_path / "export.json"
     vault.create(out, "exp", [{"id": "a", "title": "T"}])
     file, key, entries = vault.open_vault(out, "exp")
-    assert entries == [{"id": "a", "title": "T"}]
+    assert entries == [{"id": "a", "title": "T", "totp": ""}]
     assert key != vk and file["kdf"]["salt"] != f["kdf"]["salt"]
 
 
@@ -210,7 +210,7 @@ def test_merge_skips_existing_and_duplicate_ids():
     entries = []
     vault.add(entries, title="Keep")
     mine = dict(entries[0])
-    other = {"id": "x" * 32, "title": "New", "username": "", "password": "p", "url": "", "notes": ""}
+    other = {"id": "x" * 32, "title": "New", "username": "", "password": "p", "url": "", "notes": "", "totp": ""}
     assert vault.merge(entries, [mine, other, dict(other)]) == 1
     assert [e["title"] for e in entries] == ["Keep", "New"]
 

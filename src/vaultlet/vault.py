@@ -15,7 +15,7 @@ from vaultlet import crypto
 from vaultlet.errors import CorruptVault, EntryNotFound, WrongPassword
 
 REQUIRED_FIELDS = ("version", "kdf", "wrapped_key", "vault")
-ENTRY_FIELDS = ("title", "username", "password", "url", "notes")
+ENTRY_FIELDS = ("title", "username", "password", "url", "notes", "totp")
 # Upper bounds stop a hostile vault or export file from demanding e.g. 64 GiB or hours of Argon2id.
 KDF_LIMITS = {"time_cost": (1, 50), "memory_kib": (8, 4 * 1024 * 1024), "parallelism": (1, 64)}
 
@@ -38,10 +38,17 @@ def load(path: str | Path) -> dict:
         data = json.loads(text)
     except ValueError as exc:  # covers empty, truncated and non-JSON input
         raise CorruptVault("vault file is not valid JSON") from exc
+    check_file(data)
+    return data
+
+
+def check_file(data: object) -> None:
+    """Structural check of a parsed vault file; also used on blobs from the sync server and its clients."""
     if not isinstance(data, dict) or any(k not in data for k in REQUIRED_FIELDS):
         raise CorruptVault("vault file is missing required fields")
     check_kdf(data["kdf"])
-    return data
+    if not isinstance(data["kdf"].get("salt"), str):
+        raise CorruptVault("vault KDF salt is missing")
 
 
 def save(path: str | Path, file: dict) -> None:
@@ -74,11 +81,16 @@ def unlock(file: dict, password: str) -> bytes:
 
 def read_entries(file: dict, vault_key: bytes) -> list[dict]:
     try:
-        return crypto.read_entries(file, vault_key)
+        entries = crypto.read_entries(file, vault_key)
     except InvalidTag as exc:
         raise CorruptVault("vault contents failed authentication") from exc
     except (KeyError, TypeError, ValueError) as exc:
         raise CorruptVault("vault contents are malformed") from exc
+    if isinstance(entries, list):  # vaults and exports from before TOTP support lack the field
+        for e in entries:
+            if isinstance(e, dict):
+                e.setdefault("totp", "")
+    return entries
 
 
 def create(path: str | Path, password: str, entries: list[dict] | None = None) -> None:
@@ -157,9 +169,9 @@ def open_vault(path: str | Path, password: str,
 # Entry operations work on the decrypted list in memory. Callers persist with persist().
 
 def add(entries: list[dict], *, title: str, username: str = "", password: str = "",
-        url: str = "", notes: str = "") -> dict:
+        url: str = "", notes: str = "", totp: str = "") -> dict:
     entry = {"id": uuid.uuid4().hex, "title": title, "username": username,
-             "password": password, "url": url, "notes": notes}
+             "password": password, "url": url, "notes": notes, "totp": totp}
     entries.append(entry)
     return entry
 

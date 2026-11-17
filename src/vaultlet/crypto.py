@@ -7,6 +7,8 @@ import unicodedata
 
 from argon2.low_level import Type, hash_secret_raw
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 KDF_DEFAULTS = {"time_cost": 3, "memory_kib": 65536, "parallelism": 4}
 
@@ -81,3 +83,13 @@ def read_entries(file: dict, vault_key: bytes) -> list[dict]:
 def write_entries(file: dict, vault_key: bytes, entries: list[dict]) -> dict:
     plaintext = json.dumps(entries).encode()
     return {**file, "vault": _seal(vault_key, plaintext, _aad(file, b"vault"))}
+
+
+def subkey(key: bytes, info: bytes) -> bytes:
+    """Derive an independent 32-byte key for one purpose (HKDF-SHA256; INFO separates purposes)."""
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=info).derive(key)
+
+
+def sync_auth_key(password: str, kdf: dict) -> bytes:
+    """Sync login key: HKDF of the KEK. The server only learns this, and it can't be turned back into the KEK."""
+    return subkey(derive_kek(password, b64d(kdf["salt"]), kdf), b"vaultlet sync auth v1")
