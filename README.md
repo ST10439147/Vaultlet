@@ -27,7 +27,7 @@ Password management system: a local-first, zero-knowledge password manager in Py
 | Phishing look-alike sites | Yes | Fill is only offered and only answered for entries whose saved host matches the page (same host or a subdomain), on https; the page host is checked again at fill time |
 | Credentials leaking into iframes | Yes | Fill runs in the top frame only |
 | Unlocked helper left running | Partly | Locks after `--idle` seconds unused (default 300) and when the browser closes |
-| Malware or keylogger on your machine | No | Out of scope |
+| Malware or keylogger on your machine | No | Not done yet |
 | Memory scraping while unlocked | Limited | Python cannot reliably wipe memory |
 
 This is a learning and portfolio project. Keep real credentials in an audited manager until Vaultlet has had independent review.
