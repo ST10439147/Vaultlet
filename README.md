@@ -10,7 +10,7 @@ Password management system: a local-first, zero-knowledge password manager in Py
 | Compromised or curious sync server | Yes | Stores the encrypted vault file and SHA-256 of an HKDF-derived auth key; never sees the password, KEK or vault key |
 | Sync server reading the auth key in transit or memory | Partly | It's HKDF(KEK), so it can't be reversed to the KEK; it does let that server guess master passwords offline (Argon2id cost per guess), same as holding the vault file |
 | Network attacker between client and server | Yes | TLS required (https only, except loopback); self-signed servers are pinned with `--cafile` |
-| Online password guessing against the sync server | Yes | Each guess costs a client-side Argon2id run, and after 5 failures per account the server backs off exponentially to one try per 15 min. Someone who knows your account id can use this to delay your syncs by up to 15 min; the backoff is in memory and resets on restart |
+| Online password guessing against the sync server | Yes | Each guess costs a client-side Argon2id run, and after 5 failures per account the server backs off exponentially to one try per 15 min. Someone who knows your account id can use this to delay your syncs by up to 15 min. `vaultlet-server` keeps the backoff in memory (resets on restart); the Cloudflare Worker stores it in D1 |
 | Two devices editing at once | Yes | Server accepts a push only against the latest version (409 otherwise); the client merges three-way and keeps both copies of an entry edited on both sides |
 | Sync metadata on disk | Partly | `<vault>.sync` holds the URL, account id, entry ids and keyed (HMAC) fingerprints: reveals the entry count, not contents |
 | Shoulder-surfing, walk-up access | Partly | Passwords masked unless `--show`; `shell` clears the screen and locks when idle; copied passwords cleared after 20 s |
@@ -94,6 +94,21 @@ vaultlet sync                                                        # pull, mer
 - `link` downloads the account if this device has no vault. If it has one, its entries are merged in (asking for its password if it differs) and the device switches to the synced master password. Delete `<vault>.sync` to stop syncing.
 - In the TUI, `y` syncs. It asks for the master password each time, because the TUI keeps the vault key, never the password, and edits wait until the sync finishes. Set up with `register` / `link` in the CLI first.
 - Registration-token guesses are rate-limited the same way as logins.
+
+### Hosting on Cloudflare (alternative server)
+
+`worker/` is a Cloudflare Worker + D1 port of `vaultlet-server`: same routes, JSON and status codes, so the client works with it unchanged. Cloudflare provides the TLS certificate, so `--cafile` isn't needed.
+
+```
+cd worker
+npm install
+npx wrangler d1 create vaultlet-sync          # put the printed database_id in wrangler.jsonc
+npm run schema:remote                         # create the tables
+npx wrangler secret put VAULTLET_REGISTER_TOKEN
+npm run deploy                                # prints https://vaultlet-sync.<you>.workers.dev
+```
+
+Then `vaultlet sync register https://vaultlet-sync.<you>.workers.dev`, and `link` on other devices as above. Once every device is registered, `npx wrangler secret delete VAULTLET_REGISTER_TOKEN` turns registration off. For local testing: `npm run schema:local`, put the token in `worker/.dev.vars`, and `npm run dev`.
 
 ## Browser extension
 
